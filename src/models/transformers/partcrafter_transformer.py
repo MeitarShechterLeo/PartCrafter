@@ -444,7 +444,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             global_attn_block_ids = []
             if global_attn_block_id_range is not None:
                 global_attn_block_ids = list(range(global_attn_block_id_range[0], global_attn_block_id_range[1] + 1))
-        self.global_attn_block_ids = global_attn_block_ids
+        self.global_attn_block_ids = list(global_attn_block_ids)
 
         if len(global_attn_block_ids) > 0:
             # Override self-attention processors for global attention blocks

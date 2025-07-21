@@ -104,6 +104,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         scheduler: FlowMatchEulerDiscreteScheduler,
         image_encoder_dinov2: Dinov2Model,
         feature_extractor_dinov2: BitImageProcessor,
+        parent_to_image: torch.nn.Module,
     ):
         super().__init__()
 
@@ -113,6 +114,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             scheduler=scheduler,
             image_encoder_dinov2=image_encoder_dinov2,
             feature_extractor_dinov2=feature_extractor_dinov2,
+            parent_to_image=parent_to_image,
         )
 
     @property
@@ -152,6 +154,19 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         return image_embeds, uncond_image_embeds
 
+    def encode_parent(self, parent, device, num_parents_per_prompt, num_tokens):
+        dtype = next(self.image_encoder_dinov2.parameters()).dtype
+
+        parent = parent.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            parent_embeds = self.vae.encode(parent, num_tokens=num_tokens).latent_dist.mode()
+        parent_embeds = self.parent_to_image(parent_embeds)
+        parent_embeds = parent_embeds.repeat_interleave(num_parents_per_prompt, dim=0)
+            
+        uncond_parent_embeds = torch.zeros_like(parent_embeds)
+
+        return parent_embeds, uncond_parent_embeds
+
     def prepare_latents(
         self,
         batch_size,
@@ -176,7 +191,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
     @torch.no_grad()
     def __call__(
         self,
-        image: PipelineImageInput,
+        image: Union[PipelineImageInput, torch.Tensor],
+        condition_type: str = 'image',
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
         timesteps: List[int] = None,
@@ -214,9 +230,16 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         dtype = self.image_encoder_dinov2.dtype
 
         # 3. Encode condition
-        image_embeds, negative_image_embeds = self.encode_image(
-            image, device, num_images_per_prompt
-        )
+        if condition_type == 'image':
+            image_embeds, negative_image_embeds = self.encode_image(
+                image, device, num_images_per_prompt
+            )
+        elif condition_type == 'parent':
+            image_embeds, negative_image_embeds = self.encode_parent(
+                image, device, num_images_per_prompt, num_tokens
+            )
+        else:
+            raise ValueError(f"Invalid condition type: {condition_type}")
 
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
