@@ -18,6 +18,7 @@ from transformers import (
 )
 from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry
 
+from algo_prod.uni3d.src.modules.leo_uni3d import LeoUni3D
 from ..models.autoencoders import TripoSGVAEModel
 from ..models.transformers import PartCrafterDiTModel
 from .pipeline_partcrafter_output import PartCrafterPipelineOutput
@@ -105,6 +106,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         image_encoder_dinov2: Dinov2Model,
         feature_extractor_dinov2: BitImageProcessor,
         parent_to_image: torch.nn.Module,
+        text_encoder: LeoUni3D,
+        text_to_image: torch.nn.Module,
     ):
         super().__init__()
 
@@ -115,6 +118,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             image_encoder_dinov2=image_encoder_dinov2,
             feature_extractor_dinov2=feature_extractor_dinov2,
             parent_to_image=parent_to_image,
+            text_encoder=text_encoder,
+            text_to_image=text_to_image,
         )
 
     @property
@@ -155,7 +160,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         return image_embeds, uncond_image_embeds
 
     def encode_parent(self, parent, device, num_parents_per_prompt, num_tokens):
-        dtype = next(self.image_encoder_dinov2.parameters()).dtype
+        dtype = next(self.transformer.parameters()).dtype
 
         parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
@@ -166,6 +171,22 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         uncond_parent_embeds = torch.zeros_like(parent_embeds)
 
         return parent_embeds, uncond_parent_embeds
+
+    def encode_text(self, text, device, num_parents_per_prompt, condition_type):
+        dtype = next(self.transformer.parameters()).dtype
+
+        # parent = parent.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            if condition_type == 'text':
+                text_embeds = self.text_encoder.encode_text(text)['text_embeddings'].unsqueeze(1).to(device, dtype=dtype) # (num_children, 1, text_dim)
+            elif condition_type == 'text_ml':
+                text_embeds = self.text_encoder.encode_text(text)['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
+                text_embeds = self.text_to_image(text_embeds)
+        # text_embeds = text_embeds.repeat_interleave(num_parents_per_prompt, dim=0) # not supported for text currently
+            
+        uncond_text_embeds = torch.zeros_like(text_embeds)
+
+        return text_embeds, uncond_text_embeds
 
     def prepare_latents(
         self,
@@ -191,7 +212,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
     @torch.no_grad()
     def __call__(
         self,
-        image: Union[PipelineImageInput, torch.Tensor],
+        image: Union[PipelineImageInput, torch.Tensor, List[str]],
         condition_type: str = 'image',
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
@@ -210,6 +231,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         flash_octree_depth: int = 9,
         use_flash_decoder: bool = True,
         return_dict: bool = True,
+        forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -227,7 +249,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             raise ValueError("Invalid input type for image")
 
         device = self._execution_device
-        dtype = self.image_encoder_dinov2.dtype
+        dtype = self.transformer.dtype
 
         # 3. Encode condition
         if condition_type == 'image':
@@ -237,6 +259,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         elif condition_type == 'parent':
             image_embeds, negative_image_embeds = self.encode_parent(
                 image, device, num_images_per_prompt, num_tokens
+            )
+        elif condition_type == 'text' or condition_type == 'text_ml':
+            image_embeds, negative_image_embeds = self.encode_text(
+                image, device, num_images_per_prompt, condition_type
             )
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")
@@ -264,6 +290,15 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             generator,
             latents,
         )
+
+        assert forced_latents is None or forced_latents[0].shape == latents.shape, f'Got latents to be forced (inpaint) but their shape ({forced_latents[0].shape}) is inconsistent with expected number of parts ({latents.shape})'
+
+        if forced_latents is not None:
+            forced_latents, forced_latents_mask = forced_latents
+
+            noisy_forced_latents = self.scheduler.scale_noise(forced_latents[None], latents[None], timesteps) # should be (len(timesteps), B=num_parts, L, C)
+            noisy_forced_latents = torch.cat([noisy_forced_latents, forced_latents[None]], dim=0) # should be (len(timesteps)+1, B=num_parts, L, C) - last is GT
+            latents[forced_latents_mask] = noisy_forced_latents[0, forced_latents_mask]
 
         # 6. Denoising loop
         self.set_progress_bar_config(
@@ -310,6 +345,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
+                        
+                if forced_latents is not None:
+                    latents[forced_latents_mask] = noisy_forced_latents[i+1, forced_latents_mask]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

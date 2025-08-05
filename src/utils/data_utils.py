@@ -37,33 +37,35 @@ def remove_overlapping_vertices(mesh: trimesh.Trimesh, reserve_material: bool = 
     return clean_mesh
 
 RGB = [
-    (82, 170, 220),
-    (215, 91, 78),
-    (45, 136, 117), 
-    (247, 172, 83),
-    (124, 121, 121),
-    (127, 171, 209),
-    (243, 152, 101),
-    (145, 204, 192),
-    (150, 59, 121),
-    (181, 206, 78),
-    (189, 119, 149),
-    (199, 193, 222),
-    (200, 151, 54),
-    (236, 110, 102),
-    (238, 182, 212),
+    (82, 170, 220), # Sky Blue - Light and cool blue with slight cyan tint
+    (215, 91, 78), # Coral Red - Warm reddish-orange
+    (45, 136, 117), # Teal Green - Deep greenish teal
+    (247, 172, 83), # Amber / Goldenrod - Warm orange-gold
+    (124, 121, 121), # Medium Gray	Neutral mid-gray
+    (150, 59, 121), # Plum / Dark Magenta	Deep purplish-pink
+    (181, 206, 78), # Lime Green / Chartreuse	Yellow-green, muted
+    (189, 119, 149), # Mauve Rose	Dusty pink with violet tones
+    (127, 171, 209), # Light Steel Blue	Soft blue with a touch of gray
+    (243, 152, 101), # Light Coral / Apricot	Warm peachy-orange
+    (145, 204, 192), # Pale Turquoise	Soft minty green
+    (199, 193, 222), # Lavender Gray	Pale lavender with gray undertone
+    (200, 151, 54), # Brass / Ochre	Dark mustard yellow
+    (236, 110, 102), # Salmon	Bright pinkish red
+    (238, 182, 212), # 	Pastel Pink / Thistle	Light pink with violet tone
 ]
 
 
 def get_colored_mesh_composition(
     meshes: Union[List[trimesh.Trimesh], trimesh.Scene],
-    is_random: bool = True,
+    is_random: bool = False,
     is_sorted: bool = False, 
-    RGB: List[Tuple] = RGB
+    RGB: List[Tuple] = RGB,
+    emphasize_mesh_index: Optional[int] = None,
 ):
     if isinstance(meshes, trimesh.Scene):
         meshes = meshes.dump()
     if is_sorted:
+        if emphasize_mesh_index is not None: raise RuntimeWarning(f'Need to emphasize mesh number {emphasize_mesh_index} but the meshes are first sorted! need to add support to this')
         volumes = []
         for mesh in meshes:
             try:
@@ -79,6 +81,10 @@ def get_colored_mesh_composition(
             color = (np.random.rand(3) * 256).astype(int)
         else:
             color = np.array(RGB[idx % len(RGB)])
+            
+        if idx == emphasize_mesh_index:
+            color = np.array((10, 10, 10)) 
+
         mesh.visual = trimesh.visual.ColorVisuals(
             mesh=mesh,
             vertex_colors=color,

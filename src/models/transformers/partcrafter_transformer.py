@@ -404,6 +404,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if enable_part_embedding:
             self.part_embedding = nn.Embedding(max_num_parts, self.inner_dim)
             self.part_embedding.weight.data.normal_(mean=0.0, std=0.02)
+
+            self.cond_part_embedding = nn.Embedding(max_num_parts, cross_attention_dim)
+            self.cond_part_embedding.weight.data.normal_(mean=0.0, std=0.02)
         self.enable_part_embedding = enable_part_embedding
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
@@ -624,6 +627,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
+        per_part_cond: bool = False,
     ):
         """
         The [`HunyuanDiT2DModel`] forward method.
@@ -684,6 +688,18 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     "num_parts must be a torch.Tensor or int, but got {}".format(type(num_parts))
                 )
             hidden_states = hidden_states + part_embedding.unsqueeze(dim=1) # (N, T+1, D)
+
+            # In case of per-part text condition we want to add the part embeddings also to the condition
+            if per_part_cond:
+                if isinstance(num_parts, torch.Tensor):
+                    cond_part_embeddings = []
+                    for num_part in num_parts:
+                        cond_part_embedding = self.cond_part_embedding(torch.arange(num_part, device=hidden_states.device)) # (n, D)
+                        cond_part_embeddings.append(cond_part_embedding)
+                    cond_part_embeddings = torch.cat(cond_part_embeddings, dim=0) # (N, D)
+                elif isinstance(num_parts, int):
+                    cond_part_embeddings = self.cond_part_embedding(torch.arange(hidden_states.shape[0], device=hidden_states.device)) # (N, D)
+                encoder_hidden_states = encoder_hidden_states + cond_part_embeddings.unsqueeze(dim=1) # (N, T+1, D)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None

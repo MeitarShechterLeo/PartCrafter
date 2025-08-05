@@ -447,6 +447,7 @@ class PartCrafterAttnProcessor:
         temb: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         num_parts: Optional[Union[int, torch.Tensor]] = None,
+        parts_are_repeated: bool = True,
     ) -> torch.Tensor:
         from diffusers.models.embeddings import apply_rotary_emb
 
@@ -547,8 +548,16 @@ class PartCrafterAttnProcessor:
                 else:
                     # Assuming cross-attention
                     # Here 'b' is always 1
-                    k = k[::n_p]     # [b, h, nt, c]
-                    v = v[::n_p]     # [b, h, nt, c]
+                    if parts_are_repeated:
+                        k = k[::n_p]     # [b, h, nt, c]
+                        v = v[::n_p]     # [b, h, nt, c]
+                    else: # text condition - we have a unique condition per part and not the same assembly condition repeated for all parts
+                        k = rearrange(
+                            k, "(b ni) h nt c -> b h (ni nt) c", ni=n_p
+                        ) # [b, h, ni*nt, c]
+                        v = rearrange(
+                            v, "(b ni) h nt c -> b h (ni nt) c", ni=n_p
+                        ) # [b, h, ni*nt, c]
                 # Here 'b' is always 1
                 q = rearrange(
                     q, "(b ni) h nt c -> b h (ni nt) c", ni=n_p
@@ -582,8 +591,16 @@ class PartCrafterAttnProcessor:
                 # Here we need 'b' when using classifier-free guidance
                 # Control signal is repeated ni times within each (b, ni)
                 # We select only the first instance per group
-                key = key[::num_parts]     # [b, h, nt, c]
-                value = value[::num_parts] # [b, h, nt, c]
+                if parts_are_repeated:
+                    key = key[::num_parts]     # [b, h, nt, c]
+                    value = value[::num_parts] # [b, h, nt, c]
+                else: # text condition - we have a unique condition per part and not the same assembly condition repeated for all parts
+                    key = rearrange(
+                        key, "(b ni) h nt c -> b h (ni nt) c", ni=num_parts
+                    ) # [b, h, ni*nt, c]
+                    value = rearrange(
+                        value, "(b ni) h nt c -> b h (ni nt) c", ni=num_parts
+                    ) # [b, h, ni*nt, c]
             query = rearrange(
                 query, "(b ni) h nt c -> b h (ni nt) c", ni=num_parts
             ) # [b, h, ni*nt, c]
