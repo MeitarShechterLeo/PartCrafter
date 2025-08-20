@@ -123,6 +123,7 @@ from torch import nn
 
 from ..attention_processor import FusedTripoSGAttnProcessor2_0, TripoSGAttnProcessor2_0, PartCrafterAttnProcessor
 from .modeling_outputs import Transformer1DModelOutput
+from ..embeddings import FrequencyPositionalEmbedding
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -167,6 +168,7 @@ class DiTBlock(nn.Module):
         use_self_attention: bool = True,
         self_attention_norm_type: Optional[str] = None, 
         use_cross_attention: bool = True, # ada layer norm
+        use_cross_attention2: bool = False, # ada layer norm
         cross_attention_dim: Optional[int] = None,
         cross_attention_norm_type: Optional[str] = "fp32_layer_norm",
         dropout=0.0,
@@ -187,6 +189,7 @@ class DiTBlock(nn.Module):
 
         self.use_self_attention = use_self_attention
         self.use_cross_attention = use_cross_attention
+        self.use_cross_attention2 = use_cross_attention2
         self.skip_concat_front = skip_concat_front
         self.skip_norm_last = skip_norm_last
         # Define 3 blocks. Each block has its own normalization layer.
@@ -230,6 +233,22 @@ class DiTBlock(nn.Module):
                 processor=TripoSGAttnProcessor2_0(),
             )
 
+            # 2.5. Cross-Attn 2
+            if use_cross_attention2:
+                self.norm4 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
+
+                self.attn3 = Attention(
+                    query_dim=dim,
+                    cross_attention_dim=cross_attention_dim,
+                    dim_head=dim // num_attention_heads,
+                    heads=num_attention_heads,
+                    qk_norm="rms_norm" if qk_norm else None,
+                    cross_attention_norm=cross_attention_norm_type,
+                    eps=1e-6,
+                    bias=qkv_bias,
+                    processor=TripoSGAttnProcessor2_0(),
+                )
+
         # 3. Feed-forward
         self.norm3 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
@@ -259,6 +278,8 @@ class DiTBlock(nn.Module):
     def set_flash_processor(self, flash_processor):
         self.flash_processor = flash_processor
         self.attn2.processor = self.flash_processor
+        if hasattr(self, 'attn3'):
+            self.attn3.processor = self.flash_processor
 
     # Copied from diffusers.models.attention.BasicTransformerBlock.set_chunk_feed_forward
     def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int = 0):
@@ -269,10 +290,11 @@ class DiTBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None, # this will be the cls tokens if `encoder_hidden_states2` is given
         temb: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         skip: Optional[torch.Tensor] = None,
+        encoder_hidden_states2: Optional[torch.Tensor] = None, # this would be the 77 vectors in the relevant flavour
         attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         # Prepare attention kwargs
@@ -297,6 +319,11 @@ class DiTBlock(nn.Module):
                 cat = self.skip_norm(cat)
                 hidden_states = self.skip_linear(cat)
 
+        # TODO: as the encoder_hidden_state dim is not the same as hidden_states, this is commented out for the moment
+        # # If this is a global block and we're in 2-cross flavour, we'd like to add the cls tokens to each of the hidden_states
+        # if encoder_hidden_states2 is not None and len(attention_kwargs) == 0: 
+        #     hidden_states += encoder_hidden_states
+
         # 1. Self-Attention
         if self.use_self_attention:
             norm_hidden_states = self.norm1(hidden_states)
@@ -315,6 +342,15 @@ class DiTBlock(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 **attention_kwargs,
             )
+
+            if encoder_hidden_states2 is not None:
+                hidden_states = hidden_states + self.attn3(
+                    self.norm4(hidden_states),
+                    encoder_hidden_states=encoder_hidden_states2,
+                    image_rotary_emb=image_rotary_emb,
+                    **attention_kwargs,
+                )
+
 
         # FFN Layer ### TODO: switch norm2 and norm3 in the state dict
         mlp_inputs = self.norm3(hidden_states)
@@ -383,12 +419,15 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         enable_global_cross_attn: bool = True,
         global_attn_block_ids: Optional[List[int]] = None,
         global_attn_block_id_range: Optional[List[int]] = None,
+        do_cross_attention2: bool = False,
+        enable_location_embedding: bool = False,
     ):
         super().__init__()
         self.out_channels = in_channels
         self.num_heads = num_attention_heads
         self.inner_dim = width
         self.mlp_ratio = 4.0
+        self.do_cross_attention2 = do_cross_attention2
 
         time_embed_dim, timestep_input_dim = self._set_time_proj(
             "positional",
@@ -408,6 +447,19 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self.cond_part_embedding = nn.Embedding(max_num_parts, cross_attention_dim)
             self.cond_part_embedding.weight.data.normal_(mean=0.0, std=0.02)
         self.enable_part_embedding = enable_part_embedding
+        
+        if enable_location_embedding:
+            num_freqs = 8 # 8 - same as TripoSG VAE
+            input_dim = 3 # 3 - same as TripoSG VAE
+            self.embedder = FrequencyPositionalEmbedding(
+                num_freqs=num_freqs,
+                logspace=True,
+                input_dim=input_dim, 
+                include_pi=False, # False - same as TripoSG VAE
+            )
+            self.location_proj = TimestepEmbedding(
+                (num_freqs * 2 + 1) * input_dim, time_embed_dim, act_fn="gelu", out_dim=self.inner_dim
+            )
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
 
@@ -419,6 +471,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     use_self_attention=True,
                     self_attention_norm_type="fp32_layer_norm",
                     use_cross_attention=True,
+                    use_cross_attention2=do_cross_attention2,
                     cross_attention_dim=cross_attention_dim,
                     cross_attention_norm_type=None,
                     activation_fn="gelu",
@@ -453,8 +506,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # Override self-attention processors for global attention blocks
             attn_processor_dict = {}
             modified_attn_processor = []
+            attn_ids = [1, 2, 3] if do_cross_attention2 else [1, 2]
             for layer_id in range(num_layers):
-                for attn_id in [1, 2]:
+                for attn_id in attn_ids:
                     if layer_id in global_attn_block_ids:
                         # apply to both self-attention and cross-attention
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = PartCrafterAttnProcessor()
@@ -628,6 +682,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
         per_part_cond: bool = False,
+        encoder_hidden_states2: Optional[torch.Tensor] = None,
+        encoder_locations: Optional[torch.Tensor] = None,
     ):
         """
         The [`HunyuanDiT2DModel`] forward method.
@@ -699,10 +755,20 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     cond_part_embeddings = torch.cat(cond_part_embeddings, dim=0) # (N, D)
                 elif isinstance(num_parts, int):
                     cond_part_embeddings = self.cond_part_embedding(torch.arange(hidden_states.shape[0], device=hidden_states.device)) # (N, D)
-                encoder_hidden_states = encoder_hidden_states + cond_part_embeddings.unsqueeze(dim=1) # (N, T+1, D)
+                encoder_hidden_states = encoder_hidden_states + cond_part_embeddings.unsqueeze(dim=1) # (N, T, D)
+                
+                if encoder_hidden_states2 is not None:
+                    encoder_hidden_states2 = encoder_hidden_states2 + cond_part_embeddings.unsqueeze(dim=1) # (N, T, D)
+
+        if encoder_locations is not None:
+            # encoder_locations: # (N, 3)
+            encoder_locations = self.embedder(encoder_locations).to(hidden_states.dtype) # (N, 3 * (8 * 2 + 1)) = (N, 51)
+            encoder_locations = self.location_proj(encoder_locations) # (N, D)
+            hidden_states[:, 1:] = hidden_states[:, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
+        negative_encoder_hidden_states2 = torch.zeros_like(encoder_hidden_states2) if encoder_hidden_states2 is not None else None
 
         skips = []
         for layer, block in enumerate(self.blocks):
@@ -715,6 +781,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 # If in non-global attention block and disable local cross attention, use negative encoder_hidden_states
                 # Do not inject control signal into non-global attention block
                 input_encoder_hidden_states = negative_encoder_hidden_states
+                input_encoder_hidden_states2 = negative_encoder_hidden_states2
             elif (
                 (not self.enable_global_cross_attn)
                 and len(self.global_attn_block_ids) > 0
@@ -723,8 +790,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 # If in global attention block and disable global cross attention, use negative encoder_hidden_states
                 # Do not inject control signal into global attention block
                 input_encoder_hidden_states = negative_encoder_hidden_states
+                input_encoder_hidden_states2 = negative_encoder_hidden_states2
             else:
                 input_encoder_hidden_states = encoder_hidden_states
+                input_encoder_hidden_states2 = encoder_hidden_states2
             
             if len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
                 # Inject control signal into global attention block
@@ -750,6 +819,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     temb,
                     image_rotary_emb,
                     skip,
+                    input_encoder_hidden_states2,
                     input_attention_kwargs,
                     **ckpt_kwargs,
                 )
@@ -760,6 +830,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
+                    encoder_hidden_states2=input_encoder_hidden_states2,
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
 
