@@ -516,7 +516,7 @@ def hierarchical_extract_geometry_udf(
     dense_octree_depth: int = 8,
     hierarchical_octree_depth: int = 9, 
     max_num_expanded_coords: int = 1e8, 
-    batch_size: int = 100000,
+    batch_size: int = 50000,
     threshold: float = 0.003,
     verbose: bool = False,
 ):
@@ -618,7 +618,7 @@ def hierarchical_extract_geometry_udf(
         print("final grids shape = ", grid_logits.shape)
 
     # Most efficient vectorized approach
-    pred_tensor = torch.tensor(children_predictions, device=expanded_coords_norm.device)
+    pred_tensor = children_predictions
     logits_flat = grid_logits.reshape(-1)
     threshold_mask = logits_flat < threshold
 
