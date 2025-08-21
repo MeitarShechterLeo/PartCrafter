@@ -16,7 +16,7 @@ from transformers import (
     BitImageProcessor,
     Dinov2Model,
 )
-from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry
+from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry, hierarchical_extract_geometry_udf
 
 from algo_prod.uni3d.src.modules.leo_uni3d import LeoUni3D
 from ..models.autoencoders import TripoSGVAEModel
@@ -405,7 +405,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
         with self.progress_bar(total=batch_size) as progress_bar:
-            if joint_decoding:
+            if not joint_decoding:
                 for i in range(batch_size):
                     geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample
                     try:
