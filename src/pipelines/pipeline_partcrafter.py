@@ -244,6 +244,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         use_flash_decoder: bool = True,
         return_dict: bool = True,
         forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
+        encoder_locations: Optional[torch.Tensor] = None,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -286,6 +287,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
             if condition_type == 'text_ml_cls':
                 image_embeds2 = torch.cat([negative_image_embeds2, image_embeds2], dim=0)
+
+            if encoder_locations is not None:
+                encoder_locations = torch.cat([torch.zeros_like(encoder_locations), encoder_locations], dim=0)
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -343,7 +347,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     encoder_hidden_states=image_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
+                    per_part_cond=('text' in condition_type),
                     encoder_hidden_states2=image_embeds2 if condition_type == 'text_ml_cls' else None,
+                    encoder_locations=encoder_locations,
                 )[0].to(dtype)
 
                 # perform guidance

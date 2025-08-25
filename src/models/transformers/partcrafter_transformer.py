@@ -451,7 +451,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if enable_location_embedding:
             num_freqs = 8 # 8 - same as TripoSG VAE
             input_dim = 3 # 3 - same as TripoSG VAE
-            self.embedder = FrequencyPositionalEmbedding(
+            self.loc_embed = FrequencyPositionalEmbedding(
                 num_freqs=num_freqs,
                 logspace=True,
                 input_dim=input_dim, 
@@ -460,6 +460,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self.location_proj = TimestepEmbedding(
                 (num_freqs * 2 + 1) * input_dim, time_embed_dim, act_fn="gelu", out_dim=self.inner_dim
             )
+            for m in self.location_proj.modules(): 
+                if isinstance(m, torch.nn.Linear): 
+                    m.weight.data.normal_(mean=0.0, std=0.02)
+                    m.bias.data.zero_()
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
 
@@ -762,9 +766,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         if encoder_locations is not None:
             # encoder_locations: # (N, 3)
-            encoder_locations = self.embedder(encoder_locations).to(hidden_states.dtype) # (N, 3 * (8 * 2 + 1)) = (N, 51)
+            loc_padding_mask = ~(encoder_locations == 0).all(dim=-1) # (N,)
+            encoder_locations = self.loc_embed(encoder_locations).to(hidden_states.dtype) # (N, 3 * (8 * 2 + 1)) = (N, 51)
             encoder_locations = self.location_proj(encoder_locations) # (N, D)
-            hidden_states[:, 1:] = hidden_states[:, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
+            hidden_states[loc_padding_mask, 1:] = hidden_states[loc_padding_mask, 1:] + encoder_locations[loc_padding_mask].unsqueeze(dim=1) # (N, T+1, D)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
