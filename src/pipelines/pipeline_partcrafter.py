@@ -16,14 +16,13 @@ from transformers import (
     BitImageProcessor,
     Dinov2Model,
 )
-from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry, hierarchical_extract_geometry_udf
+from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry, hierarchical_extract_geometry_udf, extract_mesh_from_udf
 
 from algo_prod.uni3d.src.modules.leo_uni3d import LeoUni3D
 from ..models.autoencoders import TripoSGVAEModel
 from ..models.transformers import PartCrafterDiTModel
 from .pipeline_partcrafter_output import PartCrafterPipelineOutput
 from .pipeline_utils import TransformerDiffusionMixin
-from src.CADAssembliesCrafter.utils.utils import hierarchical_extract_geometry_udf
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -438,7 +437,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     max_num_expanded_coords=max_num_expanded_coords,
                     # verbose=True
                 )
-       
+                # vae = self.vae.to(torch.float32)
+                # geometric_func = lambda x: vae.decode(latent_dist=latents, sampled_points=x)[0].squeeze(dim=-1)
+                # mesh = extract_mesh_from_udf(geometric_func)
+                # meshes = [mesh]
+
         # Offload all models
         self.maybe_free_model_hooks()
 

@@ -516,7 +516,7 @@ def hierarchical_extract_geometry_udf(
     dense_octree_depth: int = 8,
     hierarchical_octree_depth: int = 9, 
     max_num_expanded_coords: int = 1e8, 
-    batch_size: int = 50000,
+    batch_size: int = 100000,
     threshold: float = 0.003,
     verbose: bool = False,
 ):
@@ -529,6 +529,7 @@ def hierarchical_extract_geometry_udf(
         hierarchical_octree_depth:
     Returns:
     """
+    hierarchical_octree_depth = dense_octree_depth = 8
     if isinstance(bounds, float):
         bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
@@ -550,19 +551,24 @@ def hierarchical_extract_geometry_udf(
     # Process xyz_samples in batches to avoid GPU memory issues
     num_samples = xyz_samples.shape[0]
     all_grid_logits = []
-    # all_classification_logits = []
+    all_classification_logits = []
     
     for i in range(0, num_samples, batch_size):
         end_idx = min(i + batch_size, num_samples)
         batch = xyz_samples[i:end_idx]
         
-        batch_grid_logits, _ = geometric_func(batch.unsqueeze(0))
+        batch_grid_logits, batch_classification_logits = geometric_func(batch.unsqueeze(0))
         all_grid_logits.append(batch_grid_logits.to(dtype))
-        # all_classification_logits.append(batch_classification_logits.to(dtype))
+        all_classification_logits.append(batch_classification_logits.to(dtype))
     
-    grid_logits = torch.cat(all_grid_logits, dim=1).view(grid_size[0], grid_size[1], grid_size[2])
+    if hierarchical_octree_depth > dense_octree_depth:
+        grid_logits = torch.cat(all_grid_logits, dim=1).view(grid_size[0], grid_size[1], grid_size[2])
+    else:
+        grid_logits = torch.cat(all_grid_logits, dim=1)
+    classification_logits = torch.cat(all_classification_logits, dim=1)[0]
+    children_predictions = torch.argmax(classification_logits, dim=-1)
     del all_grid_logits
-    children_predictions = []
+    points = xyz_samples
     # print(f'step 1 grid_logits shape: {grid_logits.shape}')
     for i in range(hierarchical_octree_depth - dense_octree_depth):
         curr_octree_depth = dense_octree_depth + i + 1
@@ -606,12 +612,9 @@ def hierarchical_extract_geometry_udf(
         indices = indices.type(torch.IntTensor)
         values = all_logits[:, 3]
         # breakpoint()
-        print(f"grid_logits shape: {grid_logits.shape}")
-        print(f"high_res_occupancy shape: {high_res_occupancy.shape}")
-        print(f"high_res_occupancy type: {type(high_res_occupancy)}")
-        print(f"indices shape: {indices.shape}")
         high_res_occupancy[indices[:, 0], indices[:, 1], indices[:, 2]] = values
         grid_logits = high_res_occupancy
+        points = expanded_coords_norm
         torch.cuda.empty_cache()
 
     if verbose:
@@ -621,16 +624,25 @@ def hierarchical_extract_geometry_udf(
     pred_tensor = children_predictions
     logits_flat = grid_logits.reshape(-1)
     threshold_mask = logits_flat < threshold
-
     import trimesh
     
     children_meshes = []
-    for pred_idx in range(max(children_predictions) + 1):
+    for pred_idx in torch.unique(children_predictions):
         combined_mask = threshold_mask & (pred_tensor == pred_idx)
-        vertices = expanded_coords_norm[combined_mask].cpu().numpy()
+        vertices = points[combined_mask].cpu().numpy()
         # Transform vertices to world coordinates
         # vertices = vertices / (2**hierarchical_octree_depth) * bbox_size.cpu().numpy() + bbox_min.cpu().numpy()
         mesh = trimesh.Trimesh(vertices=vertices.astype(np.float32), faces=None)
         children_meshes.append(mesh)
 
     return children_meshes
+
+
+def extract_mesh_from_udf(geometric_func):
+    from dcudf.mesh_extraction import dcudf
+    query_fun = lambda x: geometric_func(x)
+    resolution = 128
+    threshold = 0.005
+    extractor = dcudf(query_fun, resolution, threshold, is_cut=False)
+    mesh = extractor.optimize()
+    return mesh
