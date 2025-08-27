@@ -294,7 +294,8 @@ class DiTBlock(nn.Module):
         temb: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         skip: Optional[torch.Tensor] = None,
-        encoder_hidden_states2: Optional[torch.Tensor] = None, # this would be the 77 vectors in the relevant flavour
+        encoder_hidden_states2: Optional[torch.Tensor] = None, # this would be the 77 vectors in the relevant flavour or the assembly text cls
+        encoder_hidden_states2_per_part: Optional[bool] = None, # whether the `encoder_hidden_states2` is per part or global
         attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         # Prepare attention kwargs
@@ -344,11 +345,15 @@ class DiTBlock(nn.Module):
             )
 
             if encoder_hidden_states2 is not None:
+                attention_kwargs2 = attention_kwargs.copy()
+                if 'parts_are_repeated' in attention_kwargs2 and encoder_hidden_states2_per_part is not None:
+                    attention_kwargs2['parts_are_repeated'] = not encoder_hidden_states2_per_part
+                    
                 hidden_states = hidden_states + self.attn3(
                     self.norm4(hidden_states),
                     encoder_hidden_states=encoder_hidden_states2,
                     image_rotary_emb=image_rotary_emb,
-                    **attention_kwargs,
+                    **attention_kwargs2,
                 )
 
 
@@ -688,6 +693,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         per_part_cond: bool = False,
         encoder_hidden_states2: Optional[torch.Tensor] = None,
         encoder_locations: Optional[torch.Tensor] = None,
+        per_part_cond2: bool = True, # whether the second condition is also per-part
     ):
         """
         The [`HunyuanDiT2DModel`] forward method.
@@ -761,7 +767,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     cond_part_embeddings = self.cond_part_embedding(torch.arange(hidden_states.shape[0], device=hidden_states.device)) # (N, D)
                 encoder_hidden_states = encoder_hidden_states + cond_part_embeddings.unsqueeze(dim=1) # (N, T, D)
                 
-                if encoder_hidden_states2 is not None:
+                if encoder_hidden_states2 is not None and per_part_cond2:
                     encoder_hidden_states2 = encoder_hidden_states2 + cond_part_embeddings.unsqueeze(dim=1) # (N, T, D)
 
         if encoder_locations is not None:
@@ -825,6 +831,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     image_rotary_emb,
                     skip,
                     input_encoder_hidden_states2,
+                    per_part_cond2,
                     input_attention_kwargs,
                     **ckpt_kwargs,
                 )
@@ -836,6 +843,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     encoder_hidden_states2=input_encoder_hidden_states2,
+                    encoder_hidden_states2_per_part=per_part_cond2,
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
 
