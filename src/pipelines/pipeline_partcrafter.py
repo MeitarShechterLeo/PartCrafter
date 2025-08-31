@@ -177,12 +177,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         # parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
-            if condition_type == 'text':
-                text_embeds = self.text_encoder.encode_text(text)['text_embeddings'].unsqueeze(1).to(device, dtype=dtype) # (num_children, 1, text_dim)
-            elif condition_type == 'text_ml':
-                text_embeds = self.text_encoder.encode_text(text)['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
-                text_embeds = self.text_to_image(text_embeds)
-            elif condition_type == 'text_ml_cls':
+            if 'ml' in condition_type and 'cls' in condition_type: # multi-level cls + 77 vectors
                 text_vectors = self.text_encoder.encode_text(text)
 
                 text_hidden_states = text_vectors['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
@@ -194,6 +189,14 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 uncond_text_embeds = (torch.zeros_like(text_cls), torch.zeros_like(text_hidden_states))
 
                 return text_embeds, uncond_text_embeds
+
+            elif 'ml' in condition_type:
+                text_embeds = self.text_encoder.encode_text(text)['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
+                text_embeds = self.text_to_image(text_embeds)
+            
+            elif 'text' in condition_type:
+                text_embeds = self.text_encoder.encode_text(text)['text_embeddings'].unsqueeze(1).to(device, dtype=dtype) # (num_children, 1, text_dim)
+
             else:
                 raise ValueError(f'Unknown condition_type {condition_type}')
         # text_embeds = text_embeds.repeat_interleave(num_parents_per_prompt, dim=0) # not supported for text currently
@@ -287,7 +290,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             if 'parent' in condition_type:
                 assert 'ml' not in condition_type, "'text_ml' and 'parent' should not be used together"
                 image_embeds2, negative_image_embeds2 = self.encode_text(
-                    cond2, device, num_images_per_prompt, 'text' # need to get only cls for the parent
+                    cond2, device, num_images_per_prompt, condition_type # need to get only cls for the parent
                 )
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")

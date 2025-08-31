@@ -55,6 +55,14 @@ RGB = [
 ]
 
 
+def create_location_speheres(locations):
+    spheres = []
+    for loc in locations:
+        sphere = trimesh.creation.icosphere(subdivisions=2, radius=0.03)
+        sphere.apply_translation(loc)
+        spheres.append(sphere)
+    return spheres
+
 def get_colored_mesh_composition(
     meshes: Union[List[trimesh.Trimesh], trimesh.Scene],
     is_random: bool = False,

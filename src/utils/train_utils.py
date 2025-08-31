@@ -220,7 +220,7 @@ class MyEMAModel(EMAModel):
         if self.temp_stored_params is None:
             raise RuntimeError("This ExponentialMovingAverage has no `store()`ed weights " "to `restore()`")
 
-        assert len(self.temp_stored_params) == len(named_parameters), "Number of parameters to restore does not match the number of stored parameters"
+        assert len(self.temp_stored_params) == len(list(named_parameters)), "Number of parameters to restore does not match the number of stored parameters"
         
         if self.foreach:
             torch._foreach_copy_(
