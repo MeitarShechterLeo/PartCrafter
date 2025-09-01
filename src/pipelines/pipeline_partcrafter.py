@@ -251,6 +251,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         return_dict: bool = True,
         forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
         encoder_locations: Optional[torch.Tensor] = None,
+        run_POR_flow: bool = False,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -295,6 +296,13 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")
 
+        if run_POR_flow:
+            # Drop all the other children conditioning
+            children_mask = forced_latents[1]
+            image_embeds[children_mask] = negative_image_embeds[children_mask]
+            if encoder_locations is not None:
+                encoder_locations[children_mask] = -100.
+
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
             if condition_type == 'text_ml_cls':
@@ -304,7 +312,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 image_embeds2 = torch.cat([negative_image_embeds2, image_embeds2], dim=0)
 
             if encoder_locations is not None:
-                encoder_locations = torch.cat([torch.zeros_like(encoder_locations), encoder_locations], dim=0)
+                encoder_locations = torch.cat([torch.ones_like(encoder_locations) * -100., encoder_locations], dim=0)
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
