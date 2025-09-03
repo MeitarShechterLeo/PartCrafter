@@ -177,12 +177,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         # parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
-            if condition_type == 'text':
-                text_embeds = self.text_encoder.encode_text(text)['text_embeddings'].unsqueeze(1).to(device, dtype=dtype) # (num_children, 1, text_dim)
-            elif condition_type == 'text_ml':
-                text_embeds = self.text_encoder.encode_text(text)['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
-                text_embeds = self.text_to_image(text_embeds)
-            elif condition_type == 'text_ml_cls':
+            if 'ml' in condition_type and 'cls' in condition_type: # multi-level cls + 77 vectors
                 text_vectors = self.text_encoder.encode_text(text)
 
                 text_hidden_states = text_vectors['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
@@ -194,6 +189,16 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 uncond_text_embeds = (torch.zeros_like(text_cls), torch.zeros_like(text_hidden_states))
 
                 return text_embeds, uncond_text_embeds
+
+            elif 'ml' in condition_type:
+                text_embeds = self.text_encoder.encode_text(text)['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
+                text_embeds = self.text_to_image(text_embeds)
+            
+            elif 'text' in condition_type:
+                text_embeds = self.text_encoder.encode_text(text)['text_embeddings'].unsqueeze(1).to(device, dtype=dtype) # (num_children, 1, text_dim)
+
+            else:
+                raise ValueError(f'Unknown condition_type {condition_type}')
         # text_embeds = text_embeds.repeat_interleave(num_parents_per_prompt, dim=0) # not supported for text currently
             
         uncond_text_embeds = torch.zeros_like(text_embeds)
@@ -225,6 +230,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
     def __call__(
         self,
         image: Union[PipelineImageInput, torch.Tensor, List[str]],
+        cond2: Optional[Union[torch.Tensor, List[str]]] = None,
         condition_type: str = 'image',
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
@@ -244,6 +250,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         use_flash_decoder: bool = True,
         return_dict: bool = True,
         forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
+        encoder_locations: Optional[torch.Tensor] = None,
+        run_POR_flow: bool = False,
         joint_decoding: bool = False, # if True, decode all parts at once, otherwise decode one by one
     ):
         # 1. Define call parameters
@@ -280,13 +288,32 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             if condition_type == 'text_ml_cls':
                 image_embeds, image_embeds2 = image_embeds
                 negative_image_embeds, negative_image_embeds2 = negative_image_embeds
+
+            if 'parent' in condition_type:
+                assert 'ml' not in condition_type, "'text_ml' and 'parent' should not be used together"
+                image_embeds2, negative_image_embeds2 = self.encode_text(
+                    cond2, device, num_images_per_prompt, condition_type # need to get only cls for the parent
+                )
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")
+
+        if run_POR_flow:
+            # Drop all the other children conditioning
+            children_mask = forced_latents[1]
+            image_embeds[children_mask] = negative_image_embeds[children_mask]
+            if encoder_locations is not None:
+                encoder_locations[children_mask] = -100.
 
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
             if condition_type == 'text_ml_cls':
                 image_embeds2 = torch.cat([negative_image_embeds2, image_embeds2], dim=0)
+
+            if cond2 is not None:
+                image_embeds2 = torch.cat([negative_image_embeds2, image_embeds2], dim=0)
+
+            if encoder_locations is not None:
+                encoder_locations = torch.cat([torch.ones_like(encoder_locations) * -100., encoder_locations], dim=0)
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -344,7 +371,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     encoder_hidden_states=image_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
-                    encoder_hidden_states2=image_embeds2 if condition_type == 'text_ml_cls' else None,
+                    per_part_cond=('text' in condition_type),
+                    encoder_hidden_states2=image_embeds2 if (condition_type == 'text_ml_cls' or cond2 is not None) else None,
+                    encoder_locations=encoder_locations,
+                    per_part_cond2=('parent' not in condition_type),
                 )[0].to(dtype)
 
                 # perform guidance
