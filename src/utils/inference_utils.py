@@ -505,3 +505,144 @@ def flash_extract_geometry(
         mesh_v_f = (None, None)
 
     return [mesh_v_f]
+
+
+@torch.no_grad()
+def hierarchical_extract_geometry_udf(
+    geometric_func: Callable,
+    device: torch.device,
+    dtype: torch.dtype,
+    bounds: Union[Tuple[float], List[float], float] = (-1.25, -1.25, -1.25, 1.25, 1.25, 1.25),
+    dense_octree_depth: int = 8,
+    hierarchical_octree_depth: int = 9, 
+    max_num_expanded_coords: int = 1e8, 
+    batch_size: int = 100000,
+    threshold: float = 0.003,
+    verbose: bool = False,
+):
+    """
+    Args:
+        geometric_func:
+        device:
+        bounds:
+        dense_octree_depth:
+        hierarchical_octree_depth:
+    Returns:
+    """
+    hierarchical_octree_depth = dense_octree_depth = 8
+    if isinstance(bounds, float):
+        bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
+
+    bbox_min = torch.tensor(bounds[0:3]).to(device)
+    bbox_max = torch.tensor(bounds[3:6]).to(device)
+    bbox_size = bbox_max - bbox_min
+
+    xyz_samples, grid_size, length = generate_dense_grid_points_gpu(
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
+        octree_depth=dense_octree_depth,
+        indexing="ij",
+        dtype=dtype
+    )
+    
+    if verbose:
+        print(f'step 1 query num: {xyz_samples.shape[0]}')
+    
+    # Process xyz_samples in batches to avoid GPU memory issues
+    num_samples = xyz_samples.shape[0]
+    all_grid_logits = []
+    all_classification_logits = []
+    
+    for i in range(0, num_samples, batch_size):
+        end_idx = min(i + batch_size, num_samples)
+        batch = xyz_samples[i:end_idx]
+        
+        batch_grid_logits, batch_classification_logits = geometric_func(batch.unsqueeze(0))
+        all_grid_logits.append(batch_grid_logits.to(dtype))
+        all_classification_logits.append(batch_classification_logits.to(dtype))
+    
+    if hierarchical_octree_depth > dense_octree_depth:
+        grid_logits = torch.cat(all_grid_logits, dim=1).view(grid_size[0], grid_size[1], grid_size[2])
+    else:
+        grid_logits = torch.cat(all_grid_logits, dim=1)
+    classification_logits = torch.cat(all_classification_logits, dim=1)[0]
+    children_predictions = torch.argmax(classification_logits, dim=-1)
+    del all_grid_logits
+    points = xyz_samples
+    # print(f'step 1 grid_logits shape: {grid_logits.shape}')
+    for i in range(hierarchical_octree_depth - dense_octree_depth):
+        curr_octree_depth = dense_octree_depth + i + 1
+        # upsample
+        grid_size = 2**curr_octree_depth
+        normalize_offset = grid_size / 2
+        high_res_occupancy = parallel_zoom(grid_logits, 2).to(dtype)
+
+        band_threshold = 1.0
+        edge_coords = find_candidates_band(grid_logits, band_threshold)
+        expanded_coords = expand_edge_region_fast(edge_coords, grid_size=int(grid_size/2), dtype=dtype).to(dtype)
+        if verbose:
+            print(f'step {i+2} query num: {len(expanded_coords)}')
+        if max_num_expanded_coords > 0 and len(expanded_coords) > max_num_expanded_coords:
+            raise ValueError(f"expanded_coords is too large, {len(expanded_coords)} > {max_num_expanded_coords}")
+        expanded_coords_norm = (expanded_coords - normalize_offset) * (abs(bounds[0]) / normalize_offset)
+
+        # Process expanded_coords_norm in batches to avoid GPU memory issues
+        num_expanded = expanded_coords_norm.shape[0]
+        all_batch_logits = []
+        all_batch_classification_logits = []
+        
+        for j in range(0, num_expanded, batch_size):
+            end_idx = min(j + batch_size, num_expanded)
+            batch_coords = expanded_coords_norm[j:end_idx]
+            
+            batch_logits, batch_classification = geometric_func(batch_coords.unsqueeze(0))
+            all_batch_logits.append(batch_logits.to(dtype))
+            all_batch_classification_logits.append(batch_classification)
+        
+        all_logits = torch.cat(all_batch_logits, dim=1)[0]
+        del all_batch_logits
+        classification_logits = torch.cat(all_batch_classification_logits, dim=1)[0]
+        del all_batch_classification_logits
+        children_predictions = torch.argmax(classification_logits, dim=-1)
+        all_logits = torch.cat([expanded_coords_norm, all_logits], dim=1)
+        # print("all logits shape = ", all_logits.shape)
+
+        indices = all_logits[..., :3]
+        indices = indices * (normalize_offset / abs(bounds[0]))  + normalize_offset
+        indices = indices.type(torch.IntTensor)
+        values = all_logits[:, 3]
+        # breakpoint()
+        high_res_occupancy[indices[:, 0], indices[:, 1], indices[:, 2]] = values
+        grid_logits = high_res_occupancy
+        points = expanded_coords_norm
+        torch.cuda.empty_cache()
+
+    if verbose:
+        print("final grids shape = ", grid_logits.shape)
+
+    # Most efficient vectorized approach
+    pred_tensor = children_predictions
+    logits_flat = grid_logits.reshape(-1)
+    threshold_mask = logits_flat < threshold
+    import trimesh
+    
+    children_meshes = []
+    for pred_idx in torch.unique(children_predictions):
+        combined_mask = threshold_mask & (pred_tensor == pred_idx)
+        vertices = points[combined_mask].cpu().numpy()
+        # Transform vertices to world coordinates
+        # vertices = vertices / (2**hierarchical_octree_depth) * bbox_size.cpu().numpy() + bbox_min.cpu().numpy()
+        mesh = trimesh.Trimesh(vertices=vertices.astype(np.float32), faces=None)
+        children_meshes.append(mesh)
+
+    return children_meshes
+
+
+def extract_mesh_from_udf(geometric_func):
+    from dcudf.mesh_extraction import dcudf
+    query_fun = lambda x: geometric_func(x)
+    resolution = 128
+    threshold = 0.005
+    extractor = dcudf(query_fun, resolution, threshold, is_cut=False)
+    mesh = extractor.optimize()
+    return mesh

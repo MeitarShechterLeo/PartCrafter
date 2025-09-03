@@ -16,7 +16,7 @@ from transformers import (
     BitImageProcessor,
     Dinov2Model,
 )
-from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry
+from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry, hierarchical_extract_geometry_udf, extract_mesh_from_udf
 
 from algo_prod.uni3d.src.modules.leo_uni3d import LeoUni3D
 from ..models.autoencoders import TripoSGVAEModel
@@ -252,6 +252,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
         encoder_locations: Optional[torch.Tensor] = None,
         run_POR_flow: bool = False,
+        joint_decoding: bool = False, # if True, decode all parts at once, otherwise decode one by one
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -433,27 +434,44 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
         with self.progress_bar(total=batch_size) as progress_bar:
-            for i in range(batch_size):
-                geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample
-                try:
-                    mesh_v_f = hierarchical_extract_geometry(
-                        geometric_func,
-                        device,
-                        dtype=latents.dtype,
-                        bounds=bounds,
-                        dense_octree_depth=dense_octree_depth,
-                        hierarchical_octree_depth=hierarchical_octree_depth,
-                        max_num_expanded_coords=max_num_expanded_coords,
-                        # verbose=True
-                    )
-                    mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
-                except:
-                    mesh_v_f = None
-                    mesh = None
-                output.append(mesh_v_f)
-                meshes.append(mesh)
-                progress_bar.update()
-       
+            if not joint_decoding:
+                for i in range(batch_size):
+                    geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample
+                    try:
+                        mesh_v_f = hierarchical_extract_geometry(
+                            geometric_func,
+                            device,
+                            dtype=latents.dtype,
+                            bounds=bounds,
+                            dense_octree_depth=dense_octree_depth,
+                            hierarchical_octree_depth=hierarchical_octree_depth,
+                            max_num_expanded_coords=max_num_expanded_coords,
+                            # verbose=True
+                        )
+                        mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
+                    except:
+                        mesh_v_f = None
+                        mesh = None
+                    output.append(mesh_v_f)
+                    meshes.append(mesh)
+                    progress_bar.update()
+            else:
+                geometric_func = lambda x: self.vae.decode(latents, sampled_points=x)
+                meshes = hierarchical_extract_geometry_udf(
+                    geometric_func,
+                    device,
+                    dtype=latents.dtype,
+                    bounds=bounds,
+                    dense_octree_depth=dense_octree_depth,
+                    hierarchical_octree_depth=hierarchical_octree_depth,
+                    max_num_expanded_coords=max_num_expanded_coords,
+                    # verbose=True
+                )
+                # vae = self.vae.to(torch.float32)
+                # geometric_func = lambda x: vae.decode(latent_dist=latents, sampled_points=x)[0].squeeze(dim=-1)
+                # mesh = extract_mesh_from_udf(geometric_func)
+                # meshes = [mesh]
+
         # Offload all models
         self.maybe_free_model_hooks()
 
