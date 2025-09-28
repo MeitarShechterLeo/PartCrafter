@@ -164,7 +164,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
-            parent_embeds = self.vae.encode(parent, num_tokens=num_tokens).latent_dist.mode()
+            parent_embeds = self.vae.encode(parent, num_tokens=num_tokens).latent_dist.sample()
         parent_embeds = self.parent_to_image(parent_embeds)
         parent_embeds = parent_embeds.repeat_interleave(num_parents_per_prompt, dim=0)
             
@@ -270,7 +270,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             raise ValueError("Invalid input type for image")
 
         device = self._execution_device
-        dtype = self.transformer.dtype
+        dtype = self.transformer.dtype if hasattr(self.transformer, 'dtype') else next(self.transformer.parameters()).dtype
 
         # 3. Encode condition
         if condition_type == 'image':
@@ -434,9 +434,28 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
         with self.progress_bar(total=batch_size) as progress_bar:
-            if not joint_decoding:
+            if True:
+                from src.CADAssembliesCrafter.Hunyuan3D_2_1.hy3dshape.hy3dshape.pipelines import export_to_trimesh
+                meshes = []
                 for i in range(batch_size):
-                    geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample
+                    child_latents = latents[i].unsqueeze(0)
+                    child_latents = self.vae.decode(child_latents)
+                    mesh = self.vae.latents2mesh(
+                        child_latents,
+                        output_type='trimesh',
+                        bounds=1.01,
+                        mc_level=0.0,
+                        num_chunks=20000,
+                        octree_resolution=256,
+                        mc_algo='mc',
+                        enable_pbar=True
+                    )
+                    mesh = export_to_trimesh(mesh)[0]
+                    meshes.append(mesh)
+                    progress_bar.update()
+            elif not joint_decoding:
+                for i in range(batch_size):
+                    geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample()
                     try:
                         mesh_v_f = hierarchical_extract_geometry(
                             geometric_func,
