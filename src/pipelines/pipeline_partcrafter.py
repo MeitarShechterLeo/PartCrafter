@@ -252,7 +252,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
         encoder_locations: Optional[torch.Tensor] = None,
         run_POR_flow: bool = False,
-        joint_decoding: bool = False, # if True, decode all parts at once, otherwise decode one by one
+        joint_decoding: bool = False, # if True, decode all parts at once, otherwise decode one by one,
+        use_sigmas: bool = False,
+        scale_timesteps: bool = False,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -269,7 +271,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         else:
             raise ValueError("Invalid input type for image")
 
-        device = self._execution_device
+        device = self._execution_device if hasattr(self, '_execution_device') else torch.device('cuda:0')
         dtype = self.transformer.dtype if hasattr(self.transformer, 'dtype') else next(self.transformer.parameters()).dtype
 
         # 3. Encode condition
@@ -316,9 +318,15 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 encoder_locations = torch.cat([torch.ones_like(encoder_locations) * -100., encoder_locations], dim=0)
 
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, timesteps
-        )
+        if use_sigmas:
+            sigmas = np.linspace(0, 1, num_inference_steps)
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler, num_inference_steps, device, sigmas=sigmas
+            )
+        else:
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler, num_inference_steps, device, timesteps=timesteps
+            )
         num_warmup_steps = max(
             len(timesteps) - num_inference_steps * self.scheduler.order, 0
         )
@@ -351,6 +359,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             ncols=125,
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
+        if self.do_classifier_free_guidance:  
+            if type(attention_kwargs["num_parts"]) == int:
+                attention_kwargs["num_parts"] = torch.tensor([attention_kwargs["num_parts"]] * 2)
+            else:
+                attention_kwargs["num_parts"] = torch.cat([attention_kwargs["num_parts"], attention_kwargs["num_parts"]], dim=0)
+
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -364,6 +378,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 )
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
+                if scale_timesteps:
+                    timestep = timestep / self.scheduler.config.num_train_timesteps
+                timestep = timestep.to(device=device, dtype=dtype)
 
                 noise_pred = self.transformer(
                     latent_model_input,
