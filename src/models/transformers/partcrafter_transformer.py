@@ -426,6 +426,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         global_attn_block_id_range: Optional[List[int]] = None,
         do_cross_attention2: bool = False,
         enable_location_embedding: bool = False,
+        cross_attn_always_local: bool = False,
     ):
         super().__init__()
         self.out_channels = in_channels
@@ -504,6 +505,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         self.enable_local_cross_attn = enable_local_cross_attn
         self.enable_global_cross_attn = enable_global_cross_attn
+        self.cross_attn_always_local = cross_attn_always_local
 
         if global_attn_block_ids is None:
             global_attn_block_ids = []
@@ -518,7 +520,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             attn_ids = [1, 2, 3] if do_cross_attention2 else [1, 2]
             for layer_id in range(num_layers):
                 for attn_id in attn_ids:
-                    if layer_id in global_attn_block_ids:
+                    if self.cross_attn_always_local and attn_id > 1:
+                        attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = TripoSGAttnProcessor2_0()
+                    elif layer_id in global_attn_block_ids:
                         # apply to both self-attention and cross-attention
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = PartCrafterAttnProcessor()
                         modified_attn_processor.append(f'blocks.{layer_id}.attn{attn_id}.processor')
