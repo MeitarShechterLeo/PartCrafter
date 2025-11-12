@@ -159,6 +159,17 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         return image_embeds, uncond_image_embeds
 
+    def encode_images(self, images, device, num_images_per_prompt):
+        dtype = next(self.image_encoder_dinov2.parameters()).dtype
+        images_embeds = []
+        for image in images:
+            image_embeds, uncond_image_embeds = self.encode_image(image, device, num_images_per_prompt)
+            images_embeds.append(image_embeds)
+        images_embeds = torch.stack(images_embeds, dim=0)
+        uncond_images_embeds = torch.zeros_like(images_embeds)
+
+        return images_embeds, uncond_images_embeds
+
     def encode_parent(self, parent, device, num_parents_per_prompt, num_tokens):
         dtype = next(self.transformer.parameters()).dtype
 
@@ -296,6 +307,13 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 image_embeds2, negative_image_embeds2 = self.encode_text(
                     cond2, device, num_images_per_prompt, condition_type # need to get only cls for the parent
                 )
+        elif condition_type == 'parent_image':
+            image_embeds, negative_image_embeds = self.encode_image(
+                image, device, num_images_per_prompt
+            )
+            image_embeds2, negative_image_embeds2 = self.encode_image(
+                cond2, device, num_images_per_prompt
+            )
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")
 
@@ -457,15 +475,26 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 for i in range(batch_size):
                     child_latents = latents[i].unsqueeze(0)
                     child_latents = self.vae.decode(child_latents)
-                    mesh = self.vae.latents2mesh(
+                    # mesh = self.vae.latents2mesh(
+                    #     child_latents,
+                    #     output_type='trimesh',
+                    #     bounds=1.01,
+                    #     mc_level=0.0,
+                    #     num_chunks=20000,
+                    #     octree_resolution=256,
+                    #     mc_algo='mc',
+                    #     enable_pbar=True
+                    # )
+                    mesh = self.vae.latent2mesh_2(
+                        # outputs = self.vae.latents2mesh(
                         child_latents,
-                        output_type='trimesh',
                         bounds=1.01,
-                        mc_level=0.0,
-                        num_chunks=20000,
-                        octree_resolution=256,
-                        mc_algo='mc',
-                        enable_pbar=True
+                        mc_level=-1 / 512,
+                        octree_depth=8,
+                        num_chunks=400000,
+                        octree_resolution=512,
+                        mc_mode='mc',
+                        # enable_pbar=True,
                     )
                     mesh = export_to_trimesh(mesh)[0]
                     meshes.append(mesh)
