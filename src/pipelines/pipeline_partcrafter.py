@@ -475,27 +475,27 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 for i in range(batch_size):
                     child_latents = latents[i].unsqueeze(0)
                     child_latents = self.vae.decode(child_latents)
-                    # mesh = self.vae.latents2mesh(
-                    #     child_latents,
-                    #     output_type='trimesh',
-                    #     bounds=1.01,
-                    #     mc_level=0.0,
-                    #     num_chunks=20000,
-                    #     octree_resolution=256,
-                    #     mc_algo='mc',
-                    #     enable_pbar=True
-                    # )
-                    mesh = self.vae.latent2mesh_2(
-                        # outputs = self.vae.latents2mesh(
+                    mesh = self.vae.latents2mesh(
                         child_latents,
+                        output_type='trimesh',
                         bounds=1.01,
-                        mc_level=-1 / 512,
-                        octree_depth=8,
-                        num_chunks=400000,
-                        octree_resolution=512,
-                        mc_mode='mc',
-                        # enable_pbar=True,
+                        mc_level=0.0,
+                        num_chunks=20000,
+                        octree_resolution=256,
+                        mc_algo='mc',
+                        enable_pbar=True
                     )
+                    # mesh = self.vae.latent2mesh_2(
+                    #     # outputs = self.vae.latents2mesh(
+                    #     child_latents,
+                    #     bounds=1.01,
+                    #     mc_level=-1 / 512,
+                    #     octree_depth=8,
+                    #     num_chunks=400000,
+                    #     octree_resolution=512,
+                    #     mc_mode='mc',
+                    #     # enable_pbar=True,
+                    # )
                     mesh = export_to_trimesh(mesh)[0]
                     meshes.append(mesh)
                     progress_bar.update()
