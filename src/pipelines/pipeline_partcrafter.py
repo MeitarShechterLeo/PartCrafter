@@ -266,6 +266,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         joint_decoding: bool = False, # if True, decode all parts at once, otherwise decode one by one,
         use_sigmas: bool = False,
         scale_timesteps: bool = False,
+        forced_meshes: Optional[List[Optional[trimesh.Trimesh]]] = None,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -473,30 +474,33 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 from src.CADAssembliesCrafter.Hunyuan3D_2_1.hy3dshape.hy3dshape.pipelines import export_to_trimesh
                 meshes = []
                 for i in range(batch_size):
-                    child_latents = latents[i].unsqueeze(0)
-                    child_latents = self.vae.decode(child_latents)
-                    mesh = self.vae.latents2mesh(
-                        child_latents,
-                        output_type='trimesh',
-                        bounds=1.01,
-                        mc_level=0.0,
-                        num_chunks=20000,
-                        octree_resolution=256,
-                        mc_algo='mc',
-                        enable_pbar=True
-                    )
-                    # mesh = self.vae.latent2mesh_2(
-                    #     # outputs = self.vae.latents2mesh(
-                    #     child_latents,
-                    #     bounds=1.01,
-                    #     mc_level=-1 / 512,
-                    #     octree_depth=8,
-                    #     num_chunks=400000,
-                    #     octree_resolution=512,
-                    #     mc_mode='mc',
-                    #     # enable_pbar=True,
-                    # )
-                    mesh = export_to_trimesh(mesh)[0]
+                    if forced_latents is not None and forced_latents_mask[i]:
+                        mesh = forced_meshes[i]
+                    else:
+                        child_latents = latents[i].unsqueeze(0)
+                        child_latents = self.vae.decode(child_latents)
+                        mesh = self.vae.latents2mesh(
+                            child_latents,
+                            output_type='trimesh',
+                            bounds=1.01,
+                            mc_level=0.0,
+                            num_chunks=20000,
+                            octree_resolution=256,
+                            mc_algo='mc',
+                            enable_pbar=True
+                        )
+                        # mesh = self.vae.latent2mesh_2(
+                        #     # outputs = self.vae.latents2mesh(
+                        #     child_latents,
+                        #     bounds=1.01,
+                        #     mc_level=-1 / 512,
+                        #     octree_depth=8,
+                        #     num_chunks=400000,
+                        #     octree_resolution=512,
+                        #     mc_mode='mc',
+                        #     # enable_pbar=True,
+                        # )
+                        mesh = export_to_trimesh(mesh)[0]
                     meshes.append(mesh)
                     progress_bar.update()
             elif not joint_decoding:
