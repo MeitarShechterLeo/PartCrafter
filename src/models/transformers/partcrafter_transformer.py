@@ -520,7 +520,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             attn_ids = [1, 2, 3] if do_cross_attention2 else [1, 2]
             for layer_id in range(num_layers):
                 for attn_id in attn_ids:
-                    if self.cross_attn_always_local and attn_id > 1:
+                    if self.cross_attn_always_local and attn_id > 1:        # attn1 is self attention
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = TripoSGAttnProcessor2_0()
                     elif layer_id in global_attn_block_ids:
                         # apply to both self-attention and cross-attention
@@ -690,12 +690,12 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self,
         hidden_states: Optional[torch.Tensor],
         timestep: Union[int, float, torch.LongTensor],
-        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,                   # per part condition
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
         per_part_cond: bool = False,
-        encoder_hidden_states2: Optional[torch.Tensor] = None,
+        encoder_hidden_states2: Optional[torch.Tensor] = None,                  # assembly condition
         encoder_locations: Optional[torch.Tensor] = None,
         per_part_cond2: bool = True, # whether the second condition is also per-part
     ):
@@ -813,8 +813,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
                 # Inject control signal into global attention block
                 input_attention_kwargs = attention_kwargs
+                curr_cond = input_encoder_hidden_states2
             else:
                 input_attention_kwargs = None
+                curr_cond = input_encoder_hidden_states
 
             if self.training and self.gradient_checkpointing:
 
@@ -830,11 +832,11 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
-                    input_encoder_hidden_states,
+                    curr_cond,
                     temb,
                     image_rotary_emb,
                     skip,
-                    input_encoder_hidden_states2,
+                    None,
                     per_part_cond2,
                     input_attention_kwargs,
                     **ckpt_kwargs,
@@ -842,11 +844,11 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             else:
                 hidden_states = block(
                     hidden_states,
-                    encoder_hidden_states=input_encoder_hidden_states,
+                    encoder_hidden_states=curr_cond,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
-                    encoder_hidden_states2=input_encoder_hidden_states2,
+                    encoder_hidden_states2=None,
                     encoder_hidden_states2_per_part=per_part_cond2,
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
