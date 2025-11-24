@@ -150,7 +150,16 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         dtype = next(self.image_encoder_dinov2.parameters()).dtype
 
         if not isinstance(image, torch.Tensor):
-            image = self.feature_extractor_dinov2(image, return_tensors="pt").pixel_values
+            image = self.feature_extractor_dinov2(image, return_tensors="pt")
+            if isinstance(image, dict):
+                if "pixel_values" in image:
+                    image = image["pixel_values"]
+                elif "image" in image:
+                    image = image["image"]
+                else:
+                    raise ValueError("Feature extractor returned a dictionary without pixel_values")
+            else:
+                image = image.pixel_values
 
         image = image.to(device=device, dtype=dtype)
         image_embeds = self.image_encoder_dinov2(image).last_hidden_state
@@ -352,7 +361,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self._num_timesteps = len(timesteps)
 
         # 5. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels
+        num_channels_latents = self.transformer.config.in_channels if (hasattr(self.transformer, 'config') and hasattr(self.transformer.config, 'in_channels')) else self.transformer.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_tokens,
