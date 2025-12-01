@@ -856,8 +856,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
-                    encoder_hidden_states2=None,
-                    encoder_hidden_states2_per_part=curr_cond2,
+                    encoder_hidden_states2=curr_cond2,
+                    encoder_hidden_states2_per_part=per_part_cond2,
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
 
