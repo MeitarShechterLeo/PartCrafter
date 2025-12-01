@@ -427,6 +427,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         do_cross_attention2: bool = False,
         enable_location_embedding: bool = False,
         cross_attn_always_local: bool = False,
+        cross_attn_per_cond: bool = False,
     ):
         super().__init__()
         self.out_channels = in_channels
@@ -434,7 +435,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.inner_dim = width
         self.mlp_ratio = 4.0
         self.do_cross_attention2 = do_cross_attention2
-
+        self.cross_attn_per_cond = cross_attn_per_cond
+        
         time_embed_dim, timestep_input_dim = self._set_time_proj(
             "positional",
             inner_dim=self.inner_dim,
@@ -810,13 +812,19 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 input_encoder_hidden_states = encoder_hidden_states
                 input_encoder_hidden_states2 = encoder_hidden_states2
             
-            if len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
+            if self.cross_attn_per_cond:
+                input_attention_kwargs = attention_kwargs
+                curr_cond = input_encoder_hidden_states
+                curr_cond2 = input_encoder_hidden_states2
+            elif len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
                 # Inject control signal into global attention block
                 input_attention_kwargs = attention_kwargs
                 curr_cond = input_encoder_hidden_states2
+                curr_cond2 = None
             else:
                 input_attention_kwargs = None
                 curr_cond = input_encoder_hidden_states
+                curr_cond2 = None
 
             if self.training and self.gradient_checkpointing:
 
@@ -836,7 +844,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     temb,
                     image_rotary_emb,
                     skip,
-                    None,
+                    curr_cond2,
                     per_part_cond2,
                     input_attention_kwargs,
                     **ckpt_kwargs,
@@ -849,7 +857,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     encoder_hidden_states2=None,
-                    encoder_hidden_states2_per_part=per_part_cond2,
+                    encoder_hidden_states2_per_part=curr_cond2,
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
 
