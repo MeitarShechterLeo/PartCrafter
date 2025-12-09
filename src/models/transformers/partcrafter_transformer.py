@@ -427,7 +427,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         do_cross_attention2: bool = False,
         enable_location_embedding: bool = False,
         cross_attn_always_local: bool = False,
-        cross_attn_per_cond: bool = False,
+        cross_attn_per_cond: bool = True,
     ):
         super().__init__()
         self.out_channels = in_channels
