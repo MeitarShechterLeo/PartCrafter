@@ -184,13 +184,60 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
-            parent_embeds = self.vae.encode(parent, num_tokens=num_tokens).latent_dist.sample()
+            if 'num_tokens' in self.vae.encode.__code__.co_varnames:
+                parent_embeds = self.vae.encode(parent, num_tokens=num_tokens)
+            else:
+                if parent.shape[-1] == 6:
+                    parent = torch.cat([parent, torch.zeros((*parent.shape[:-1], 1), device=parent.device)], dim=-1)
+                parent_embeds = self.vae.encode(parent)
+            if hasattr(parent_embeds, 'latent_dist'):
+                parent_embeds = parent_embeds.latent_dist.sample()
         parent_embeds = self.parent_to_image(parent_embeds)
         parent_embeds = parent_embeds.repeat_interleave(num_parents_per_prompt, dim=0)
             
         uncond_parent_embeds = torch.zeros_like(parent_embeds)
 
         return parent_embeds, uncond_parent_embeds
+    
+    def encode_pc_condition(self, pcs, device, num_children_per_prompt, num_tokens):
+        dtype = next(self.transformer.parameters()).dtype
+
+        pcs = pcs.to(device=device, dtype=dtype)
+        coords, normals = self._split_pc_and_normals(pcs)
+        coords = self._normalize_pc(coords)
+        pcs = torch.cat([coords, normals], dim=-1) if normals is not None else coords
+
+        with torch.no_grad():
+            if 'num_tokens' in self.vae.encode.__code__.co_varnames:
+                pc_embeds = self.vae.encode(pcs, num_tokens=num_tokens)
+            else:
+                if pcs.shape[-1] == 6:
+                    pcs = torch.cat([pcs, torch.zeros((*pcs.shape[:-1], 1), device=pcs.device)], dim=-1)
+                pc_embeds = self.vae.encode(pcs)
+            if hasattr(pc_embeds, 'latent_dist'):
+                pc_embeds = pc_embeds.latent_dist.sample()
+            else:
+                pc_embeds = pc_embeds
+        pc_embeds = self.parent_to_image(pc_embeds)
+        pc_embeds = pc_embeds.repeat_interleave(num_children_per_prompt, dim=0)
+
+        uncond_pc_embeds = torch.zeros_like(pc_embeds)
+
+        return pc_embeds, uncond_pc_embeds
+
+    def _split_pc_and_normals(self, pcs):
+        if pcs.shape[-1] <= 3:
+            return pcs, None
+        coords = pcs[..., :3]
+        normals = pcs[..., 3:]
+        if normals.numel() == 0:
+            normals = None
+        return coords, normals
+
+    def _normalize_pc(self, coords):
+        shift = (coords.max(dim=1, keepdim=True)[0] + coords.min(dim=1, keepdim=True)[0]) / 2
+        scale = (coords - shift).abs().max(dim=1, keepdim=True)[0].max(dim=-1, keepdim=True)[0]
+        return (coords - shift) / (scale + 1e-8)
 
     def encode_text(self, text, device, num_parents_per_prompt, condition_type):
         dtype = next(self.transformer.parameters()).dtype
@@ -330,6 +377,18 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 image_embeds2, negative_image_embeds2 = self.encode_image(
                     cond2, device, num_images_per_prompt
                 )
+        elif 'pc' in condition_type:
+            image_embeds, negative_image_embeds = self.encode_pc_condition(
+                image, device, num_images_per_prompt, num_tokens
+            )
+            if 'parent' in condition_type:
+                if cond2 is None:
+                    image_embeds2 = torch.zeros_like(image_embeds)
+                    negative_image_embeds2 = torch.zeros_like(negative_image_embeds)
+                else:
+                    image_embeds2, negative_image_embeds2 = self.encode_parent(
+                        cond2, device, num_images_per_prompt, num_tokens
+                    )
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")
 
@@ -382,9 +441,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         if forced_latents is not None:
             forced_latents, forced_latents_mask = forced_latents
-
             noisy_forced_latents = self.scheduler.scale_noise(forced_latents[None], latents[None], timesteps) # should be (len(timesteps), B=num_parts, L, C)
             noisy_forced_latents = torch.cat([noisy_forced_latents, forced_latents[None]], dim=0) # should be (len(timesteps)+1, B=num_parts, L, C) - last is GT
+            noisy_forced_latents = noisy_forced_latents.to(device=device, dtype=latents.dtype)
             latents[forced_latents_mask] = noisy_forced_latents[0, forced_latents_mask]
 
         # 6. Denoising loop
@@ -447,7 +506,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         latents = latents.to(latents_dtype)
                         
                 if forced_latents is not None:
-                    latents[forced_latents_mask] = noisy_forced_latents[i+1, forced_latents_mask]
+                    latents[forced_latents_mask] = noisy_forced_latents[i+1, forced_latents_mask].to(device=device, dtype=latents.dtype)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -489,7 +548,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 from src.CADAssembliesCrafter.Hunyuan3D_2_1.hy3dshape.hy3dshape.pipelines import export_to_trimesh
                 meshes = []
                 for i in range(batch_size):
-                    if forced_latents is not None and forced_latents_mask[i]:
+                    if forced_latents is not None and forced_latents_mask[i] and forced_meshes is not None and forced_meshes[i] is not None:
                         mesh = forced_meshes[i]
                     else:
                         child_latents = latents[i].unsqueeze(0)
