@@ -316,6 +316,7 @@ class DiTBlock(nn.Module):
         encoder_hidden_states2_per_part: Optional[bool] = None, # whether the `encoder_hidden_states2` is per part or global
         attention_kwargs: Optional[Dict[str, Any]] = None,
         encoder_locations: Optional[torch.Tensor] = None,
+        encoder_locations_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Prepare attention kwargs
         attention_kwargs = attention_kwargs or {}
@@ -376,11 +377,15 @@ class DiTBlock(nn.Module):
                 )
         
         if self.multi_location_cond:
+            location_attention_kwargs = attention_kwargs
+            if encoder_locations_attention_mask is not None:
+                location_attention_kwargs = attention_kwargs.copy()
+                location_attention_kwargs["attention_mask"] = encoder_locations_attention_mask
             hidden_states = hidden_states + self.attn4(
                 self.norm5(hidden_states),
                 encoder_hidden_states=encoder_locations,
                 image_rotary_emb=image_rotary_emb,
-                **attention_kwargs,
+                **location_attention_kwargs,
             )
 
 
@@ -496,7 +501,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 include_pi=False, # False - same as TripoSG VAE
             )
             self.location_proj = TimestepEmbedding(
-                (num_freqs * 2 + 1) * input_dim, time_embed_dim, act_fn="gelu", out_dim=self.inner_dim
+                ## if multi_location_cond is True, the location projection is used via cross attention, so we need to use the cross attention dimension
+                (num_freqs * 2 + 1) * input_dim, time_embed_dim, act_fn="gelu", out_dim=self.inner_dim if not self.multi_location_cond else cross_attention_dim
             )
             for m in self.location_proj.modules(): 
                 if isinstance(m, torch.nn.Linear): 
@@ -811,13 +817,24 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 if encoder_hidden_states2 is not None and per_part_cond2:
                     encoder_hidden_states2 = encoder_hidden_states2 + cond_part_embeddings.unsqueeze(dim=1) # (N, T, D)
 
+        location_attention_mask = None
         if encoder_locations is not None:
             # encoder_locations: # (N, 3)
-            loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
-            encoder_locations = self.loc_embed(encoder_locations[loc_padding_mask]).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
-            encoder_locations = self.location_proj(encoder_locations) # (N', D)
-            if self.enable_location_embedding:
+            if self.config.enable_location_embedding:
+                loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
+                encoder_locations = self.loc_embed(encoder_locations[loc_padding_mask]).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
+                encoder_locations = self.location_proj(encoder_locations) # (N', D)
                 hidden_states[loc_padding_mask, 1:] = hidden_states[loc_padding_mask, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
+            
+            if self.config.multi_location_cond:
+                loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
+                encoder_locations = encoder_locations.masked_fill(~loc_padding_mask.unsqueeze(-1), 0.0) # (N, D)
+                encoder_locations = self.loc_embed(encoder_locations).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
+                encoder_locations = self.location_proj(encoder_locations) # (N', D)
+
+                # Use a boolean mask so attention uses masked_fill with -inf internally
+                location_attention_mask = loc_padding_mask  # (N, seq_len) boolean mask
+                encoder_locations = encoder_locations.masked_fill(~loc_padding_mask.unsqueeze(-1), 0.0) # (N, D)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
@@ -884,6 +901,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     per_part_cond2,
                     input_attention_kwargs,
                     encoder_locations,
+                    location_attention_mask,
                     **ckpt_kwargs,
                 )
             else:
@@ -897,6 +915,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     encoder_hidden_states2_per_part=per_part_cond2,
                     attention_kwargs=input_attention_kwargs,
                     encoder_locations=encoder_locations,
+                    encoder_locations_attention_mask=location_attention_mask,
                 )  # (N, T+1, D)
 
             if layer < self.config.num_layers // 2:
