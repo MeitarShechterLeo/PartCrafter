@@ -9,18 +9,24 @@ import torch
 import trimesh
 from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler  
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import (
     BitImageProcessor,
     Dinov2Model,
 )
-from ..utils.inference_utils import hierarchical_extract_geometry, flash_extract_geometry, hierarchical_extract_geometry_udf, extract_mesh_from_udf
 
 from algo_prod.uni3d.src.modules.leo_uni3d import LeoUni3D
+
 from ..models.autoencoders import TripoSGVAEModel
 from ..models.transformers import PartCrafterDiTModel
+from ..utils.inference_utils import (
+    extract_mesh_from_udf,
+    flash_extract_geometry,
+    hierarchical_extract_geometry,
+    hierarchical_extract_geometry_udf,
+)
 from .pipeline_partcrafter_output import PartCrafterPipelineOutput
 from .pipeline_utils import TransformerDiffusionMixin
 
@@ -95,11 +101,11 @@ def retrieve_timesteps(
 
 class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
     """
-    Pipeline for image to 3D part-level object generation.       
+    Pipeline for image to 3D part-level object generation.
     """
 
     def __init__(
-        self,   
+        self,
         vae: TripoSGVAEModel,
         transformer: PartCrafterDiTModel,
         scheduler: FlowMatchEulerDiscreteScheduler,
@@ -157,7 +163,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 elif "image" in image:
                     image = image["image"]
                 else:
-                    raise ValueError("Feature extractor returned a dictionary without pixel_values")
+                    raise ValueError(
+                        "Feature extractor returned a dictionary without pixel_values"
+                    )
             else:
                 image = image.pixel_values
 
@@ -172,7 +180,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         dtype = next(self.image_encoder_dinov2.parameters()).dtype
         images_embeds = []
         for image in images:
-            image_embeds, uncond_image_embeds = self.encode_image(image, device, num_images_per_prompt)
+            image_embeds, uncond_image_embeds = self.encode_image(
+                image, device, num_images_per_prompt
+            )
             images_embeds.append(image_embeds)
         images_embeds = torch.stack(images_embeds, dim=0)
         uncond_images_embeds = torch.zeros_like(images_embeds)
@@ -184,43 +194,121 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
-            parent_embeds = self.vae.encode(parent, num_tokens=num_tokens).latent_dist.sample()
+            if "num_tokens" in self.vae.encode.__code__.co_varnames:
+                parent_embeds = self.vae.encode(parent, num_tokens=num_tokens)
+            else:
+                if parent.shape[-1] == 6:
+                    parent = torch.cat(
+                        [
+                            parent,
+                            torch.zeros((*parent.shape[:-1], 1), device=parent.device),
+                        ],
+                        dim=-1,
+                    )
+                parent_embeds = self.vae.encode(parent)
+            if hasattr(parent_embeds, "latent_dist"):
+                parent_embeds = parent_embeds.latent_dist.sample()
         parent_embeds = self.parent_to_image(parent_embeds)
         parent_embeds = parent_embeds.repeat_interleave(num_parents_per_prompt, dim=0)
-            
+
         uncond_parent_embeds = torch.zeros_like(parent_embeds)
 
         return parent_embeds, uncond_parent_embeds
+
+    def encode_pc_condition(self, pcs, device, num_children_per_prompt, num_tokens):
+        dtype = next(self.transformer.parameters()).dtype
+
+        pcs = pcs.to(device=device, dtype=dtype)
+        coords, normals = self._split_pc_and_normals(pcs)
+        coords = self._normalize_pc(coords)
+        pcs = torch.cat([coords, normals], dim=-1) if normals is not None else coords
+
+        with torch.no_grad():
+            if "num_tokens" in self.vae.encode.__code__.co_varnames:
+                pc_embeds = self.vae.encode(pcs, num_tokens=num_tokens)
+            else:
+                if pcs.shape[-1] == 6:
+                    pcs = torch.cat(
+                        [pcs, torch.zeros((*pcs.shape[:-1], 1), device=pcs.device)],
+                        dim=-1,
+                    )
+                pc_embeds = self.vae.encode(pcs)
+            if hasattr(pc_embeds, "latent_dist"):
+                pc_embeds = pc_embeds.latent_dist.sample()
+            else:
+                pc_embeds = pc_embeds
+        pc_embeds = self.parent_to_image(pc_embeds)
+        pc_embeds = pc_embeds.repeat_interleave(num_children_per_prompt, dim=0)
+
+        uncond_pc_embeds = torch.zeros_like(pc_embeds)
+
+        return pc_embeds, uncond_pc_embeds
+
+    def _split_pc_and_normals(self, pcs):
+        if pcs.shape[-1] <= 3:
+            return pcs, None
+        coords = pcs[..., :3]
+        normals = pcs[..., 3:]
+        if normals.numel() == 0:
+            normals = None
+        return coords, normals
+
+    def _normalize_pc(self, coords):
+        shift = (
+            coords.max(dim=1, keepdim=True)[0] + coords.min(dim=1, keepdim=True)[0]
+        ) / 2
+        scale = (
+            (coords - shift)
+            .abs()
+            .max(dim=1, keepdim=True)[0]
+            .max(dim=-1, keepdim=True)[0]
+        )
+        return (coords - shift) / (scale + 1e-8)
 
     def encode_text(self, text, device, num_parents_per_prompt, condition_type):
         dtype = next(self.transformer.parameters()).dtype
 
         # parent = parent.to(device=device, dtype=dtype)
         with torch.no_grad():
-            if 'ml' in condition_type and 'cls' in condition_type: # multi-level cls + 77 vectors
+            if (
+                "ml" in condition_type and "cls" in condition_type
+            ):  # multi-level cls + 77 vectors
                 text_vectors = self.text_encoder.encode_text(text)
 
-                text_hidden_states = text_vectors['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
+                text_hidden_states = text_vectors["text_hidden_states"].to(
+                    device, dtype=dtype
+                )  # (num_children, 77, text_dim=1280)
                 text_hidden_states = self.text_to_image(text_hidden_states)
-                
-                text_cls = text_vectors['text_embeddings'].unsqueeze(1).to(device, dtype=dtype)  # (num_children, 1, text_dim=1280)
-                
-                text_embeds = (text_cls, text_hidden_states) # TODO TODO TODO
-                uncond_text_embeds = (torch.zeros_like(text_cls), torch.zeros_like(text_hidden_states))
+
+                text_cls = (
+                    text_vectors["text_embeddings"].unsqueeze(1).to(device, dtype=dtype)
+                )  # (num_children, 1, text_dim=1280)
+
+                text_embeds = (text_cls, text_hidden_states)  # TODO TODO TODO
+                uncond_text_embeds = (
+                    torch.zeros_like(text_cls),
+                    torch.zeros_like(text_hidden_states),
+                )
 
                 return text_embeds, uncond_text_embeds
 
-            elif 'ml' in condition_type:
-                text_embeds = self.text_encoder.encode_text(text)['text_hidden_states'].to(device, dtype=dtype) # (num_children, 77, text_dim=1280)
+            elif "ml" in condition_type:
+                text_embeds = self.text_encoder.encode_text(text)[
+                    "text_hidden_states"
+                ].to(device, dtype=dtype)  # (num_children, 77, text_dim=1280)
                 text_embeds = self.text_to_image(text_embeds)
-            
-            elif 'text' in condition_type:
-                text_embeds = self.text_encoder.encode_text(text)['text_embeddings'].unsqueeze(1).to(device, dtype=dtype) # (num_children, 1, text_dim)
+
+            elif "text" in condition_type:
+                text_embeds = (
+                    self.text_encoder.encode_text(text)["text_embeddings"]
+                    .unsqueeze(1)
+                    .to(device, dtype=dtype)
+                )  # (num_children, 1, text_dim)
 
             else:
-                raise ValueError(f'Unknown condition_type {condition_type}')
+                raise ValueError(f"Unknown condition_type {condition_type}")
         # text_embeds = text_embeds.repeat_interleave(num_parents_per_prompt, dim=0) # not supported for text currently
-            
+
         uncond_text_embeds = torch.zeros_like(text_embeds)
 
         return text_embeds, uncond_text_embeds
@@ -251,7 +339,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self,
         image: Union[PipelineImageInput, torch.Tensor, List[str]],
         cond2: Optional[Union[torch.Tensor, List[str]]] = None,
-        condition_type: str = 'image',
+        condition_type: str = "image",
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
         timesteps: List[int] = None,
@@ -262,17 +350,26 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        bounds: Union[Tuple[float], List[float], float] = (-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-        dense_octree_depth: int = 8, 
+        bounds: Union[Tuple[float], List[float], float] = (
+            -1.005,
+            -1.005,
+            -1.005,
+            1.005,
+            1.005,
+            1.005,
+        ),
+        dense_octree_depth: int = 8,
         hierarchical_octree_depth: int = 9,
         max_num_expanded_coords: int = 1e8,
         flash_octree_depth: int = 9,
         use_flash_decoder: bool = True,
         return_dict: bool = True,
-        forced_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, #[0] - tokens, [1] - mask
+        forced_latents: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # [0] - tokens, [1] - mask
         encoder_locations: Optional[torch.Tensor] = None,
         run_POR_flow: bool = False,
-        joint_decoding: bool = False, # if True, decode all parts at once, otherwise decode one by one,
+        joint_decoding: bool = False,  # if True, decode all parts at once, otherwise decode one by one,
         use_sigmas: bool = False,
         scale_timesteps: bool = False,
         forced_meshes: Optional[List[Optional[trimesh.Trimesh]]] = None,
@@ -292,33 +389,46 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         else:
             raise ValueError("Invalid input type for image")
 
-        device = self._execution_device if hasattr(self, '_execution_device') else torch.device('cuda:0')
-        dtype = self.transformer.dtype if hasattr(self.transformer, 'dtype') else next(self.transformer.parameters()).dtype
+        device = (
+            self._execution_device
+            if hasattr(self, "_execution_device")
+            else torch.device("cuda:0")
+        )
+        dtype = (
+            self.transformer.dtype
+            if hasattr(self.transformer, "dtype")
+            else next(self.transformer.parameters()).dtype
+        )
 
         # 3. Encode condition
         image_embeds2, negative_image_embeds2 = None, None
-        if condition_type == 'image':
+        if condition_type == "image":
             image_embeds, negative_image_embeds = self.encode_image(
                 image, device, num_images_per_prompt
             )
-        elif condition_type == 'parent':
+        elif condition_type == "parent":
             image_embeds, negative_image_embeds = self.encode_parent(
                 image, device, num_images_per_prompt, num_tokens
             )
-        elif 'text' in condition_type:
+        elif "text" in condition_type:
             image_embeds, negative_image_embeds = self.encode_text(
                 image, device, num_images_per_prompt, condition_type
             )
-            if condition_type == 'text_ml_cls':
+            if condition_type == "text_ml_cls":
                 image_embeds, image_embeds2 = image_embeds
                 negative_image_embeds, negative_image_embeds2 = negative_image_embeds
 
-            if 'parent' in condition_type:
-                assert 'ml' not in condition_type, "'text_ml' and 'parent' should not be used together"
-                image_embeds2, negative_image_embeds2 = self.encode_text(
-                    cond2, device, num_images_per_prompt, condition_type # need to get only cls for the parent
+            if "parent" in condition_type:
+                assert "ml" not in condition_type, (
+                    "'text_ml' and 'parent' should not be used together"
                 )
-        elif condition_type == 'parent_image':
+                image_embeds2, negative_image_embeds2 = self.encode_text(
+                    cond2,
+                    device,
+                    num_images_per_prompt,
+                    condition_type,  # need to get only cls for the parent
+                )
+        elif condition_type == "parent_image":
             image_embeds, negative_image_embeds = self.encode_image(
                 image, device, num_images_per_prompt
             )
@@ -330,6 +440,18 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 image_embeds2, negative_image_embeds2 = self.encode_image(
                     cond2, device, num_images_per_prompt
                 )
+        elif "pc" in condition_type:
+            image_embeds, negative_image_embeds = self.encode_pc_condition(
+                image, device, num_images_per_prompt, num_tokens
+            )
+            if "parent" in condition_type:
+                if cond2 is None:
+                    image_embeds2 = torch.zeros_like(image_embeds)
+                    negative_image_embeds2 = torch.zeros_like(negative_image_embeds)
+                else:
+                    image_embeds2, negative_image_embeds2 = self.encode_parent(
+                        cond2, device, num_images_per_prompt, num_tokens
+                    )
         else:
             raise ValueError(f"Invalid condition type: {condition_type}")
 
@@ -338,18 +460,25 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             children_mask = forced_latents[1]
             image_embeds[children_mask] = negative_image_embeds[children_mask]
             if encoder_locations is not None:
-                encoder_locations[children_mask] = -100.
+                encoder_locations[children_mask] = -100.0
 
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
-            if condition_type == 'text_ml_cls':
-                image_embeds2 = torch.cat([negative_image_embeds2, image_embeds2], dim=0)
+            if condition_type == "text_ml_cls":
+                image_embeds2 = torch.cat(
+                    [negative_image_embeds2, image_embeds2], dim=0
+                )
 
             if image_embeds2 is not None:
-                image_embeds2 = torch.cat([negative_image_embeds2, image_embeds2], dim=0)
+                image_embeds2 = torch.cat(
+                    [negative_image_embeds2, image_embeds2], dim=0
+                )
 
             if encoder_locations is not None:
-                encoder_locations = torch.cat([torch.ones_like(encoder_locations) * -100., encoder_locations], dim=0)
+                encoder_locations = torch.cat(
+                    [torch.ones_like(encoder_locations) * -100.0, encoder_locations],
+                    dim=0,
+                )
 
         # 4. Prepare timesteps
         if use_sigmas:
@@ -367,7 +496,14 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self._num_timesteps = len(timesteps)
 
         # 5. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels if (hasattr(self.transformer, 'config') and hasattr(self.transformer.config, 'in_channels')) else self.transformer.in_channels
+        num_channels_latents = (
+            self.transformer.config.in_channels
+            if (
+                hasattr(self.transformer, "config")
+                and hasattr(self.transformer.config, "in_channels")
+            )
+            else self.transformer.in_channels
+        )
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_tokens,
@@ -378,26 +514,41 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             latents,
         )
 
-        assert forced_latents is None or forced_latents[0].shape == latents.shape, f'Got latents to be forced (inpaint) but their shape ({forced_latents[0].shape}) is inconsistent with expected number of parts ({latents.shape})'
+        assert forced_latents is None or forced_latents[0].shape == latents.shape, (
+            f"Got latents to be forced (inpaint) but their shape ({forced_latents[0].shape}) is inconsistent with expected number of parts ({latents.shape})"
+        )
 
         if forced_latents is not None:
             forced_latents, forced_latents_mask = forced_latents
-
-            noisy_forced_latents = self.scheduler.scale_noise(forced_latents[None], latents[None], timesteps) # should be (len(timesteps), B=num_parts, L, C)
-            noisy_forced_latents = torch.cat([noisy_forced_latents, forced_latents[None]], dim=0) # should be (len(timesteps)+1, B=num_parts, L, C) - last is GT
+            noisy_forced_latents = self.scheduler.scale_noise(
+                forced_latents[None], latents[None], timesteps
+            )  # should be (len(timesteps), B=num_parts, L, C)
+            noisy_forced_latents = torch.cat(
+                [noisy_forced_latents, forced_latents[None]], dim=0
+            )  # should be (len(timesteps)+1, B=num_parts, L, C) - last is GT
+            noisy_forced_latents = noisy_forced_latents.to(
+                device=device, dtype=latents.dtype
+            )
             latents[forced_latents_mask] = noisy_forced_latents[0, forced_latents_mask]
 
         # 6. Denoising loop
         self.set_progress_bar_config(
-            desc="Denoising", 
+            desc="Denoising",
             ncols=125,
-            disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
+            disable=self._progress_bar_config["disable"]
+            if hasattr(self, "_progress_bar_config")
+            else False,
         )
-        if self.do_classifier_free_guidance:  
+        if self.do_classifier_free_guidance:
             if type(attention_kwargs["num_parts"]) == int:
-                attention_kwargs["num_parts"] = torch.tensor([attention_kwargs["num_parts"]] * 2)
+                attention_kwargs["num_parts"] = torch.tensor(
+                    [attention_kwargs["num_parts"]] * 2
+                )
             else:
-                attention_kwargs["num_parts"] = torch.cat([attention_kwargs["num_parts"], attention_kwargs["num_parts"]], dim=0)
+                attention_kwargs["num_parts"] = torch.cat(
+                    [attention_kwargs["num_parts"], attention_kwargs["num_parts"]],
+                    dim=0,
+                )
 
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -422,10 +573,15 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     encoder_hidden_states=image_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
-                    per_part_cond=('text' in condition_type),
-                    encoder_hidden_states2=image_embeds2 if (condition_type in ('text_ml_cls', 'parent_image') or cond2 is not None) else None,
+                    per_part_cond=("text" in condition_type),
+                    encoder_hidden_states2=image_embeds2
+                    if (
+                        condition_type in ("text_ml_cls", "parent_image")
+                        or cond2 is not None
+                    )
+                    else None,
                     encoder_locations=encoder_locations,
-                    per_part_cond2=('parent' not in condition_type),
+                    per_part_cond2=("parent" not in condition_type),
                 )[0].to(dtype)
 
                 # perform guidance
@@ -445,9 +601,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
-                        
+
                 if forced_latents is not None:
-                    latents[forced_latents_mask] = noisy_forced_latents[i+1, forced_latents_mask]
+                    latents[forced_latents_mask] = noisy_forced_latents[
+                        i + 1, forced_latents_mask
+                    ].to(device=device, dtype=latents.dtype)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -475,34 +633,43 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 ):
                     progress_bar.update()
 
-
         # 7. decoder mesh
         self.vae.set_flash_decoder()
         output, meshes = [], []
         self.set_progress_bar_config(
-            desc="Decoding", 
+            desc="Decoding",
             ncols=125,
-            disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
+            disable=self._progress_bar_config["disable"]
+            if hasattr(self, "_progress_bar_config")
+            else False,
         )
         with self.progress_bar(total=batch_size) as progress_bar:
             if True:
-                from src.CADAssembliesCrafter.Hunyuan3D_2_1.hy3dshape.hy3dshape.pipelines import export_to_trimesh
+                from src.CADAssembliesCrafter.Hunyuan3D_2_1.hy3dshape.hy3dshape.pipelines import (
+                    export_to_trimesh,
+                )
+
                 meshes = []
                 for i in range(batch_size):
-                    if forced_latents is not None and forced_latents_mask[i]:
+                    if (
+                        forced_latents is not None
+                        and forced_latents_mask[i]
+                        and forced_meshes is not None
+                        and forced_meshes[i] is not None
+                    ):
                         mesh = forced_meshes[i]
                     else:
                         child_latents = latents[i].unsqueeze(0)
                         child_latents = self.vae.decode(child_latents)
                         mesh = self.vae.latents2mesh(
                             child_latents,
-                            output_type='trimesh',
+                            output_type="trimesh",
                             bounds=1.01,
                             mc_level=0.0,
                             num_chunks=20000,
                             octree_resolution=256,
-                            mc_algo='mc',
-                            enable_pbar=True
+                            mc_algo="mc",
+                            enable_pbar=True,
                         )
                         # mesh = self.vae.latent2mesh_2(
                         #     # outputs = self.vae.latents2mesh(
@@ -520,7 +687,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     progress_bar.update()
             elif not joint_decoding:
                 for i in range(batch_size):
-                    geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample()
+                    geometric_func = lambda x: self.vae.decode(
+                        latents[i].unsqueeze(0), sampled_points=x
+                    ).sample()
                     try:
                         mesh_v_f = hierarchical_extract_geometry(
                             geometric_func,
@@ -532,7 +701,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                             max_num_expanded_coords=max_num_expanded_coords,
                             # verbose=True
                         )
-                        mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
+                        mesh = trimesh.Trimesh(
+                            mesh_v_f[0].astype(np.float32), mesh_v_f[1]
+                        )
                     except:
                         mesh_v_f = None
                         mesh = None

@@ -169,6 +169,7 @@ class DiTBlock(nn.Module):
         self_attention_norm_type: Optional[str] = None, 
         use_cross_attention: bool = True, # ada layer norm
         use_cross_attention2: bool = False, # ada layer norm
+        multi_location_cond: bool = False,
         cross_attention_dim: Optional[int] = None,
         cross_attention_norm_type: Optional[str] = "fp32_layer_norm",
         dropout=0.0,
@@ -190,6 +191,7 @@ class DiTBlock(nn.Module):
         self.use_self_attention = use_self_attention
         self.use_cross_attention = use_cross_attention
         self.use_cross_attention2 = use_cross_attention2
+        self.multi_location_cond = multi_location_cond
         self.skip_concat_front = skip_concat_front
         self.skip_norm_last = skip_norm_last
         # Define 3 blocks. Each block has its own normalization layer.
@@ -249,6 +251,22 @@ class DiTBlock(nn.Module):
                     processor=TripoSGAttnProcessor2_0(),
                 )
 
+            if multi_location_cond:
+                self.norm5 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
+                
+                self.attn4 = Attention(
+                    query_dim=dim,
+                    cross_attention_dim=cross_attention_dim,
+                    dim_head=dim // num_attention_heads,
+                    heads=num_attention_heads,
+                    qk_norm="rms_norm" if qk_norm else None,
+                    cross_attention_norm=cross_attention_norm_type,
+                    eps=1e-6,
+                    bias=qkv_bias,
+                    processor=TripoSGAttnProcessor2_0(),
+                )
+                    
+
         # 3. Feed-forward
         self.norm3 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
@@ -297,6 +315,8 @@ class DiTBlock(nn.Module):
         encoder_hidden_states2: Optional[torch.Tensor] = None, # this would be the 77 vectors in the relevant flavour or the assembly text cls
         encoder_hidden_states2_per_part: Optional[bool] = None, # whether the `encoder_hidden_states2` is per part or global
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        encoder_locations: Optional[torch.Tensor] = None,
+        encoder_locations_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Prepare attention kwargs
         attention_kwargs = attention_kwargs or {}
@@ -355,6 +375,18 @@ class DiTBlock(nn.Module):
                     image_rotary_emb=image_rotary_emb,
                     **attention_kwargs2,
                 )
+        
+        if self.multi_location_cond:
+            location_attention_kwargs = attention_kwargs
+            if encoder_locations_attention_mask is not None:
+                location_attention_kwargs = attention_kwargs.copy()
+                location_attention_kwargs["attention_mask"] = encoder_locations_attention_mask
+            hidden_states = hidden_states + self.attn4(
+                self.norm5(hidden_states),
+                encoder_hidden_states=encoder_locations,
+                image_rotary_emb=image_rotary_emb,
+                **location_attention_kwargs,
+            )
 
 
         # FFN Layer ### TODO: switch norm2 and norm3 in the state dict
@@ -428,6 +460,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         enable_location_embedding: bool = False,
         cross_attn_always_local: bool = False,
         cross_attn_per_cond: bool = True,
+        multi_location_cond: bool = False,
     ):
         super().__init__()
         self.out_channels = in_channels
@@ -436,7 +469,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.mlp_ratio = 4.0
         self.do_cross_attention2 = do_cross_attention2
         self.cross_attn_per_cond = cross_attn_per_cond
-        
+        self.multi_location_cond = multi_location_cond
+        assert not (enable_location_embedding and multi_location_cond), "enable_location_embedding and multi_location_cond cannot be True at the same time"
+
         time_embed_dim, timestep_input_dim = self._set_time_proj(
             "positional",
             inner_dim=self.inner_dim,
@@ -456,7 +491,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self.cond_part_embedding.weight.data.normal_(mean=0.0, std=0.02)
         self.enable_part_embedding = enable_part_embedding
         
-        if enable_location_embedding:
+        if enable_location_embedding or multi_location_cond:
             num_freqs = 8 # 8 - same as TripoSG VAE
             input_dim = 3 # 3 - same as TripoSG VAE
             self.loc_embed = FrequencyPositionalEmbedding(
@@ -466,7 +501,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 include_pi=False, # False - same as TripoSG VAE
             )
             self.location_proj = TimestepEmbedding(
-                (num_freqs * 2 + 1) * input_dim, time_embed_dim, act_fn="gelu", out_dim=self.inner_dim
+                ## if multi_location_cond is True, the location projection is used via cross attention, so we need to use the cross attention dimension
+                (num_freqs * 2 + 1) * input_dim, time_embed_dim, act_fn="gelu", out_dim=self.inner_dim if not self.multi_location_cond else cross_attention_dim
             )
             for m in self.location_proj.modules(): 
                 if isinstance(m, torch.nn.Linear): 
@@ -484,6 +520,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     self_attention_norm_type="fp32_layer_norm",
                     use_cross_attention=True,
                     use_cross_attention2=do_cross_attention2,
+                    multi_location_cond=multi_location_cond,
                     cross_attention_dim=cross_attention_dim,
                     cross_attention_norm_type=None,
                     activation_fn="gelu",
@@ -519,7 +556,11 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # Override self-attention processors for global attention blocks
             attn_processor_dict = {}
             modified_attn_processor = []
-            attn_ids = [1, 2, 3] if do_cross_attention2 else [1, 2]
+            attn_ids = [1, 2]
+            if do_cross_attention2:
+                attn_ids.append(3)
+            if multi_location_cond:
+                attn_ids.append(4)
             for layer_id in range(num_layers):
                 for attn_id in attn_ids:
                     if self.cross_attn_always_local and attn_id > 1:        # attn1 is self attention
@@ -776,13 +817,26 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 if encoder_hidden_states2 is not None and per_part_cond2:
                     encoder_hidden_states2 = encoder_hidden_states2 + cond_part_embeddings.unsqueeze(dim=1) # (N, T, D)
 
+        location_attention_mask = None
         if encoder_locations is not None:
             # encoder_locations: # (N, 3)
-            loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
-            if loc_padding_mask.any():
-                encoder_locations = self.loc_embed(encoder_locations[loc_padding_mask]).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
-                encoder_locations = self.location_proj(encoder_locations) # (N', D)
-                hidden_states[loc_padding_mask, 1:] = hidden_states[loc_padding_mask, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
+            if self.config.enable_location_embedding:
+                loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
+                if loc_padding_mask.any():
+                    encoder_locations = self.loc_embed(encoder_locations[loc_padding_mask]).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
+                    encoder_locations = self.location_proj(encoder_locations) # (N', D)
+                    hidden_states[loc_padding_mask, 1:] = hidden_states[loc_padding_mask, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
+            
+            if self.config.multi_location_cond:
+                loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
+                if loc_padding_mask.any():
+                    encoder_locations = encoder_locations.masked_fill(~loc_padding_mask.unsqueeze(-1), 0.0) # (N, D)
+                    encoder_locations = self.loc_embed(encoder_locations).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
+                    encoder_locations = self.location_proj(encoder_locations) # (N', D)
+
+                    # Use a boolean mask so attention uses masked_fill with -inf internally
+                    location_attention_mask = loc_padding_mask  # (N, seq_len) boolean mask
+                    encoder_locations = encoder_locations.masked_fill(~loc_padding_mask.unsqueeze(-1), 0.0) # (N, D)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
@@ -848,6 +902,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     curr_cond2,
                     per_part_cond2,
                     input_attention_kwargs,
+                    encoder_locations,
+                    location_attention_mask,
                     **ckpt_kwargs,
                 )
             else:
@@ -860,6 +916,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     encoder_hidden_states2=curr_cond2,
                     encoder_hidden_states2_per_part=per_part_cond2,
                     attention_kwargs=input_attention_kwargs,
+                    encoder_locations=encoder_locations,
+                    encoder_locations_attention_mask=location_attention_mask,
                 )  # (N, T+1, D)
 
             if layer < self.config.num_layers // 2:
