@@ -779,9 +779,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if encoder_locations is not None:
             # encoder_locations: # (N, 3)
             loc_padding_mask = ~(encoder_locations == -100.).all(dim=-1) # (N,)
-            encoder_locations = self.loc_embed(encoder_locations[loc_padding_mask]).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
-            encoder_locations = self.location_proj(encoder_locations) # (N', D)
-            hidden_states[loc_padding_mask, 1:] = hidden_states[loc_padding_mask, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
+            if loc_padding_mask.any():
+                encoder_locations = self.loc_embed(encoder_locations[loc_padding_mask]).to(hidden_states.dtype) # (N', 3 * (8 * 2 + 1)) = (N, 51)
+                encoder_locations = self.location_proj(encoder_locations) # (N', D)
+                hidden_states[loc_padding_mask, 1:] = hidden_states[loc_padding_mask, 1:] + encoder_locations.unsqueeze(dim=1) # (N, T+1, D)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
