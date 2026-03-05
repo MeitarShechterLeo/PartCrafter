@@ -52,6 +52,32 @@ def compute_mutual_nearest_distance_for_meshes(
     min_1_to_2, min_2_to_1 = compute_mutual_nearest_distance(points1, points2, metric=metric)
     return min_1_to_2, min_2_to_1
 
+def compute_point_to_mesh_distance(
+    points: np.ndarray,
+    mesh: trimesh.Trimesh,
+) -> np.ndarray:
+    """Compute the shortest distance from each point to the mesh surface using pcu."""
+    import point_cloud_utils as pcu
+    vertices = mesh.vertices.astype(np.float32)
+    faces = mesh.faces.astype(np.int32)
+    distances, _, _ = pcu.closest_points_on_mesh(points.astype(np.float32), vertices, faces)
+    return distances
+
+def compute_mesh_distance(
+    mesh1: trimesh.Trimesh,
+    mesh2: trimesh.Trimesh,
+    num_samples: int = 10000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample points from each mesh and compute shortest distance to the other mesh surface.
+
+    Returns (dist_1_to_2, dist_2_to_1) where each is an array of per-point distances.
+    """
+    points1 = sample_from_mesh(mesh1, num_samples)
+    points2 = sample_from_mesh(mesh2, num_samples)
+    dist_1_to_2 = compute_point_to_mesh_distance(points1, mesh2)
+    dist_2_to_1 = compute_point_to_mesh_distance(points2, mesh1)
+    return dist_1_to_2, dist_2_to_1
+
 def compute_chamfer_distance(
     mesh1: trimesh.Trimesh,
     mesh2: trimesh.Trimesh,
@@ -106,6 +132,29 @@ def compute_cd_and_f_score_in_training(
     precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
     fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)
     return chamfer_dist, fscore
+
+def compute_IoU_monte_carlo(
+    mesh1: trimesh.Trimesh,
+    mesh2: trimesh.Trimesh,
+    num_samples: int = 100000,
+) -> float:
+    """Fast Monte Carlo IoU: sample random points in the combined bounding box
+    and estimate intersection/union via mesh containment checks."""
+    # Combined bounding box of both meshes
+    all_bounds = np.array([mesh1.bounds, mesh2.bounds])
+    min_bound = all_bounds[:, 0, :].min(axis=0)
+    max_bound = all_bounds[:, 1, :].max(axis=0)
+
+    # Sample uniformly in the bounding box
+    points = np.random.uniform(min_bound, max_bound, size=(num_samples, 3))
+
+    inside1 = mesh1.contains(points)
+    inside2 = mesh2.contains(points)
+
+    intersection = np.sum(inside1 & inside2)
+    union = np.sum(inside1 | inside2)
+    iou = float(intersection) / float(union) if union > 0 else 0.0
+    return iou
 
 def get_voxel_set(
     mesh: trimesh.Trimesh,

@@ -55,13 +55,33 @@ RGB = [
 ]
 
 
-def create_location_speheres(locations):
+def create_location_speheres(locations, pad_value: float = -100.0):
     spheres = []
-    for loc in locations:
-        sphere = trimesh.creation.icosphere(subdivisions=2, radius=0.03)
-        sphere.apply_translation(loc)
-        spheres.append(sphere)
-    return spheres
+    color_ids = []
+    if isinstance(locations, torch.Tensor):
+        locations = locations.detach().cpu().numpy()
+    if locations.ndim == 3:
+        for part_idx, part_locs in enumerate(locations):
+            for loc in part_locs:
+                if np.any(loc == pad_value):
+                    continue
+                if loc.shape not in [(3,), (2,)]:
+                    raise ValueError(f"Location shape {loc.shape} is not supported")
+                sphere = trimesh.creation.icosphere(subdivisions=2, radius=0.03)
+                sphere.apply_translation(loc)
+                spheres.append(sphere)
+                color_ids.append(part_idx)
+    else:
+        for loc in locations:
+            if np.any(loc == pad_value):
+                continue
+            if loc.shape not in [(3,), (2,)]:
+                raise ValueError(f"Location shape {loc.shape} is not supported")
+            sphere = trimesh.creation.icosphere(subdivisions=2, radius=0.03)
+            sphere.apply_translation(loc)
+            spheres.append(sphere)
+            color_ids.append(len(color_ids))
+    return spheres, color_ids
 
 def get_colored_mesh_composition(
     meshes: Union[List[trimesh.Trimesh], trimesh.Scene],
@@ -69,6 +89,7 @@ def get_colored_mesh_composition(
     is_sorted: bool = False, 
     RGB: List[Tuple] = RGB,
     emphasize_mesh_index: Optional[int] = None,
+    color_ids: Optional[List[int]] = None,
 ):
     if isinstance(meshes, trimesh.Scene):
         meshes = meshes.dump()
@@ -88,7 +109,8 @@ def get_colored_mesh_composition(
         if is_random:
             color = (np.random.rand(3) * 256).astype(int)
         else:
-            color = np.array(RGB[idx % len(RGB)])
+            color_idx = color_ids[idx] if color_ids is not None else idx
+            color = np.array(RGB[color_idx % len(RGB)])
             
         if idx == emphasize_mesh_index:
             color = np.array((10, 10, 10)) 
